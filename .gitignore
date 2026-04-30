@@ -1,0 +1,8 @@
+output/
+cache/
+.build/
+binary/
+chroot/
+__pycache__/
+*.egg-info/
+flash/nomad_flash/bundled/*.tar

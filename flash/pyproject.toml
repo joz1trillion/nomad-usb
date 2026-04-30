@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nomad-flash"
+version = "0.5.0"
+description = "Flash tool for the Project Nomad survival USB"
+requires-python = ">=3.10"
+dependencies = [
+    # Web framework — small, fast, modern API.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    # Templating for the few server-rendered HTML pages (the wizard
+    # itself is a static SPA, but we render the entry page server-side
+    # so it can inject runtime config like the API base URL).
+    "jinja2>=3.1",
+    # WebSocket support for real-time progress streaming. Bundled with
+    # uvicorn[standard] but listed for clarity.
+    "websockets>=12",
+    # Docker daemon client — much nicer than shelling out to `docker`.
+    "docker>=7.0",
+    # Pretty CLI output for the cli subcommand.
+    "rich>=13",
+    # Argument parsing for the CLI.
+    "click>=8.1",
+]
+
+[project.scripts]
+nomad-flash = "nomad_flash.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nomad_flash*"]
+
+[tool.setuptools.package-data]
+nomad_flash = [
+    "static/**/*",
+    "templates/**/*",
+    "bundled/**/*",
+]

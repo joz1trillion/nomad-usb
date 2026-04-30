@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wrapper around `lb clean`. Use `./auto/clean` to tear down build
+# artifacts between builds.
+set -e
+lb clean noauto "${@}"

@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# This is the master configuration for `lb config`. When you run
+# `lb config` in this directory, live-build finds this file and
+# uses it instead of the default behavior.
+#
+# Run `lb config --help` inside the builder container to see every
+# available option if you want to tweak anything.
+
+set -e
+
+lb config noauto \
+    --mode debian \
+    --distribution trixie \
+    --architecture amd64 \
+    --archive-areas "main contrib non-free non-free-firmware" \
+    --binary-images iso-hybrid \
+    --bootloaders grub-efi,grub-pc \
+    --linux-flavours amd64 \
+    --firmware-binary true \
+    --firmware-chroot true \
+    --apt-indices false \
+    --memtest none \
+    --win32-loader false \
+    --debian-installer none \
+    --iso-application "Project Nomad USB" \
+    --iso-publisher "Nomad" \
+    --iso-volume "NOMAD_LIVE" \
+    --bootappend-live "boot=live components quiet loglevel=3" \
+    "${@}"

@@ -1,0 +1,33 @@
+[Unit]
+Description=Start Project Nomad containers
+Requires=nomad-mount.service docker.service
+After=nomad-mount.service docker.service nomad-init.service
+
+# If there's no compose file, skip cleanly instead of failing. This
+# handles the case where someone boots the ISO before placing a
+# compose file on the data partition (e.g. initial setup / exploration).
+ConditionPathExists=/mnt/nomad-data/nomad/docker-compose.yml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/mnt/nomad-data/nomad
+
+# The compose-up logic has moved into a wrapper script so it can
+# retry on transient failures. The #1 failure we've seen is mysql's
+# first-ever initialization taking longer than compose's dependency
+# healthcheck tolerance — ~2+ minutes on a USB drive. A single
+# compose-up attempt may give up before mysql is ready, leaving the
+# admin container in a "Created" state forever. Retrying handles this
+# cleanly because on attempt 2, mysql is already initialized and
+# becomes healthy in seconds.
+ExecStart=/usr/local/sbin/nomad-start
+ExecStop=/usr/bin/docker-compose down
+
+# Generous timeout — the retry loop needs room to run up to 5 times
+# with 60s sleeps between attempts. Worst case: ~10 minutes.
+TimeoutStartSec=600
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,102 @@
+#!/bin/bash
+#
+# nomad-mount: start-and-setup or stop the NOMAD_DATA partition.
+# Invoked by nomad-mount.service.
+#
+# Start (default):
+#   - Mount LABEL=NOMAD_DATA at /mnt/nomad-data (fail hard if not found)
+#   - Ensure the standard top-level subdir layout exists
+#   - Pre-create per-app storage subdirs so Nomad apps don't crash-loop
+#     on first start from missing bind-mount sources
+#   - Create /opt/project-nomad -> /mnt/nomad-data/nomad symlink so
+#     Nomad admin's hardcoded paths resolve to the data partition
+#
+# Stop:
+#   - Remove the symlink (so the RAM overlay isn't left with a dangling
+#     reference after umount) and unmount the partition
+
+set -euo pipefail
+
+DATA_MOUNT="/mnt/nomad-data"
+DATA_LABEL="NOMAD_DATA"
+OPT_SYMLINK="/opt/project-nomad"
+
+# ---------- stop path ----------
+if [ "${1:-start}" = "stop" ]; then
+    # Remove symlink only if it's actually a symlink (don't clobber
+    # a real directory on the off-chance something else is going on)
+    if [ -L "$OPT_SYMLINK" ]; then
+        rm -f "$OPT_SYMLINK"
+    fi
+    umount "$DATA_MOUNT" || true
+    exit 0
+fi
+
+# ---------- start path ----------
+
+# Mount point should be baked in, but be defensive.
+mkdir -p "$DATA_MOUNT"
+
+# Mount by label. Fail hard if not present — downstream services
+# (docker, nomad-init, nomad-start) must not come up against a
+# non-existent data partition.
+mount -L "$DATA_LABEL" "$DATA_MOUNT" -o defaults,noatime
+
+# Top-level layout — the three directories the flash tool places:
+#   docker/  is docker's data-root
+#   nomad/   holds the compose file and per-app storage dirs
+#   images/  holds pre-saved docker image tarballs for first-boot load
+mkdir -p "$DATA_MOUNT/docker" "$DATA_MOUNT/nomad" "$DATA_MOUNT/images"
+
+# Per-app storage subdirs. Nomad's admin spawns app containers with
+# bind mounts pointing at these paths; if the path doesn't exist,
+# docker creates it on demand as an empty dir owned by root, and
+# the app may refuse to start or crash-loop.
+#
+# This list should grow as new apps are discovered. The ones here
+# are confirmed needed from prior test runs:
+NOMAD_STORAGE="$DATA_MOUNT/nomad/storage"
+mkdir -p \
+    "$NOMAD_STORAGE/zim" \
+    "$NOMAD_STORAGE/flatnotes" \
+    "$NOMAD_STORAGE/kolibri" \
+    "$NOMAD_STORAGE/mysql" \
+    "$NOMAD_STORAGE/redis"
+
+# Kiwix additionally needs an initial (empty) library XML so the
+# server doesn't exit on startup. The admin populates this file as
+# zim files are downloaded.
+KIWIX_LIB="$NOMAD_STORAGE/zim/kiwix-library.xml"
+if [ ! -f "$KIWIX_LIB" ]; then
+    cat > "$KIWIX_LIB" <<'EOF'
+<?xml version="1.0"?>
+<library version="20110515"/>
+EOF
+fi
+
+# Symlink /opt/project-nomad -> /mnt/nomad-data/nomad.
+# Nomad's admin container (ghcr.io/.../project-nomad) hardcodes
+# /opt/project-nomad/ as the source path when spawning sibling app
+# containers. Without this symlink, those containers bind-mount from
+# an empty directory on the RAM overlay — their data is invisible
+# and evaporates at reboot.
+#
+# `ln -sfn` semantics:
+#   -s symbolic
+#   -f force (unlink existing target)
+#   -n don't follow existing symlink-to-directory (critical; otherwise
+#      repeated runs create a symlink inside the symlinked directory)
+#
+# We only proceed if $OPT_SYMLINK is either missing, or already a
+# symlink. If it exists as a real directory, something is wrong
+# (e.g. a previous boot had no nomad-mount run) — clean it up first.
+if [ -e "$OPT_SYMLINK" ] && [ ! -L "$OPT_SYMLINK" ]; then
+    # It's a real directory/file, not a symlink. Nuke it so ln can
+    # create the link. Any data that accumulated there was on the
+    # RAM overlay and would be lost on reboot anyway.
+    rm -rf "$OPT_SYMLINK"
+fi
+mkdir -p "$(dirname "$OPT_SYMLINK")"
+ln -sfn "$DATA_MOUNT/nomad" "$OPT_SYMLINK"
+
+echo "nomad-mount: $DATA_MOUNT ready; $OPT_SYMLINK -> $DATA_MOUNT/nomad"

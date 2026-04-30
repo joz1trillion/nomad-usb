@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# Chroot hook — runs inside the chroot during the live-build process,
+# AFTER all packages are installed. This is where we flip systemd
+# service states, fix permissions on our includes, and do any other
+# "I couldn't do this with a file drop-in" setup.
+
+set -e
+
+echo ">>> nomad-setup hook: starting"
+
+# --- Permissions ---
+# Shell scripts in our includes lose +x during the tar/copy cycle.
+# Fix them all in one place rather than per-file.
+chmod +x /usr/local/sbin/nomad-passwords
+chmod +x /usr/local/sbin/nomad-mount
+chmod +x /usr/local/sbin/nomad-ssh-keys
+chmod +x /usr/local/sbin/nomad-init
+chmod +x /usr/local/sbin/nomad-start
+chmod +x /usr/local/sbin/nomad-hotspot
+chmod +x /usr/local/sbin/nomad-install-to-disk
+chmod +x /usr/local/sbin/nomad-firstboot-ui
+chmod +x /usr/local/bin/nomad
+chmod +x /etc/profile.d/nomad-banner.sh
+
+# Sudoers drop-ins are refused by sudo unless perms are exactly 0440.
+chmod 0440 /etc/sudoers.d/nomad
+
+# --- Service states ---
+# Enable what we want running at boot:
+echo ">>> enabling core services"
+systemctl enable ssh
+systemctl enable docker
+systemctl enable connman
+
+# Nomad services. Two flows on first boot vs subsequent boots:
+#
+#   FIRST BOOT (no /mnt/nomad-data/.nomad-initialized):
+#     multi-user.target → nomad-firstboot-ui takes tty1 (Conflicts
+#     getty@tty1 so login prompt won't appear), runs the verbose
+#     setup UI, on success touches the flag and reboots.
+#
+#   SUBSEQUENT BOOTS (flag exists):
+#     ConditionPathExists fails on nomad-firstboot-ui → it exits
+#     immediately → getty@tty1 starts normally → MOTD on login.
+#
+# Both flows always run nomad-mount (mounts NOMAD_DATA) and
+# nomad-passwords (sets nomad/root passwords every boot since the
+# live overlay resets /etc/shadow).
+echo ">>> enabling nomad services"
+systemctl enable nomad-passwords
+systemctl enable nomad-mount
+systemctl enable nomad-ssh-keys
+systemctl enable nomad-init
+systemctl enable nomad-start
+systemctl enable nomad-firstboot-ui
+
+# Hotspot tools are INSTALLED but NOT RUNNING by default. LAN is the
+# default posture; a future control script will flip these on.
+echo ">>> disabling hotspot services (available but dormant)"
+systemctl disable hostapd 2>/dev/null || true
+systemctl disable dnsmasq 2>/dev/null || true
+
+# --- Network manager conflicts ---
+# Debian ships with TWO network managers that can conflict with ConnMan:
+#   - systemd-networkd (probably inactive, but mask so nothing enables it)
+#   - networking.service (legacy ifupdown, reads /etc/network/interfaces
+#     and requests its own DHCP lease, creating duplicate IPs on interfaces
+#     ConnMan is also managing)
+# Mask both.
+echo ">>> masking conflicting network managers (ConnMan is in charge)"
+systemctl mask systemd-networkd 2>/dev/null || true
+systemctl mask systemd-networkd-wait-online 2>/dev/null || true
+systemctl mask networking 2>/dev/null || true
+
+# Keep systemd-resolved — it's the DNS resolver and ConnMan integrates
+# with it fine.
+
+echo ">>> nomad-setup hook: complete"

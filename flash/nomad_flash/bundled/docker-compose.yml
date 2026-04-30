@@ -1,0 +1,143 @@
+# Project Nomad compose — adapted for the offline survival USB.
+#
+# Differences from the upstream management_compose.yaml in the
+# crosstalk-solutions/project-nomad repo:
+#   - Volume paths moved from /opt/project-nomad to /mnt/nomad-data/nomad
+#   - pull_policy changed from "always" to "never" (offline-first)
+#   - updater service gated behind the "online" compose profile
+#   - Default passwords set to real (but still-change-me) values
+#
+# This file is the TEMPLATE. The flash tool copies it to
+# /mnt/nomad-data/nomad/docker-compose.yml at flash time. It is not
+# used directly from /usr/share on the booted system.
+
+name: project-nomad
+
+services:
+  admin:
+    image: ghcr.io/crosstalk-solutions/project-nomad:latest
+    pull_policy: never
+    container_name: nomad_admin
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/nomad-data/nomad/storage:/app/storage
+      - /tmp/nomad-disk-info.json:/app/storage/nomad-disk-info.json
+      - /var/run/docker.sock:/var/run/docker.sock
+      # NOTE: we deliberately do NOT bind-mount ./entrypoint.sh here.
+      # Upstream's management_compose.yaml does, but the script lives
+      # in the upstream repo at install/entrypoint.sh, not at the root,
+      # and it's ALREADY baked into the image via the Dockerfile
+      # (COPY install/entrypoint.sh /usr/local/bin/entrypoint.sh).
+      # The bind mount would overlay an empty/missing host file on top
+      # of the working in-image copy, silently breaking startup.
+      #
+      # Similarly, upstream references ./wait-for-it.sh which does not
+      # exist at all in the upstream repo. The wait-for-it problem it
+      # was meant to solve is already handled by `depends_on` with
+      # `condition: service_healthy` on mysql and redis below.
+      - nomad-update-shared:/app/update-shared
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - LOG_LEVEL=debug
+      - APP_KEY=CHANGE_ME_generate_a_random_key
+      - HOST=0.0.0.0
+      - URL=http://localhost:8080
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=nomad
+      - DB_USER=nomad_user
+      - DB_PASSWORD=CHANGE_ME_nomad_db_password
+      - DB_NAME=nomad
+      - DB_SSL=false
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dozzle:
+    image: amir20/dozzle:v10.0
+    pull_policy: never
+    container_name: nomad_dozzle
+    restart: unless-stopped
+    ports:
+      - "9999:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOZZLE_ENABLE_ACTIONS=true
+      - DOZZLE_ENABLE_SHELL=true
+
+  mysql:
+    image: mysql:8.0
+    pull_policy: never
+    container_name: nomad_mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=CHANGE_ME_mysql_root_password
+      - MYSQL_DATABASE=nomad
+      - MYSQL_USER=nomad_user
+      - MYSQL_PASSWORD=CHANGE_ME_nomad_db_password
+    volumes:
+      - /mnt/nomad-data/nomad/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    pull_policy: never
+    container_name: nomad_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - /mnt/nomad-data/nomad/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Updater is present but dormant. It needs internet (to pull Nomad
+  # updates) and, as upstream ships it, a build step (which also needs
+  # internet). So we gate the whole thing behind the "online" profile.
+  #
+  # To actually use it:
+  #   cd /mnt/nomad-data/nomad
+  #   docker compose --profile online up -d updater
+  #
+  # Or to pull everything including updater:
+  #   docker compose --profile online up -d
+  updater:
+    profiles: ["online"]
+    build:
+      context: ./sidecar-updater
+      dockerfile: Dockerfile
+    container_name: nomad_updater
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/nomad-data/nomad:/opt/project-nomad
+      - nomad-update-shared:/shared
+
+volumes:
+  nomad-update-shared:
+    driver: local

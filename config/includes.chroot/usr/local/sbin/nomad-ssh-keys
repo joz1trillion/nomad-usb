@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# nomad-ssh-keys: persist SSH host keys across reboots.
+#
+# The live system's /etc/ssh/ lives on the RAM overlay, so ssh host
+# keys are regenerated fresh every boot. That's bad for users because
+# they hit "REMOTE HOST IDENTIFICATION HAS CHANGED" on every reconnect.
+#
+# Strategy:
+#   First boot:  live system generates fresh keys, we copy them to
+#                /mnt/nomad-data/ssh-host-keys/ for safekeeping
+#   Later boots: copy the stored keys over the freshly-generated
+#                (soon-to-be-discarded) ones before sshd starts
+#
+# Why copy instead of bind-mount? Bind-mounting /etc/ssh/ over the
+# whole directory would also replace sshd_config, moduli, and the
+# dpkg-shipped files — we only want to override the host_key files.
+# Copying individual files is simpler and more targeted.
+
+set -euo pipefail
+
+STORE="/mnt/nomad-data/ssh-host-keys"
+SSH_DIR="/etc/ssh"
+
+mkdir -p "$STORE"
+
+# Pattern to match all host key files (rsa, ecdsa, ed25519, dsa, ...).
+# Both the private and the corresponding .pub files.
+KEY_PATTERN="ssh_host_*_key"
+
+# If the store is empty (first boot), seed it from the live system's
+# freshly-generated keys. openssh-server's postinst generates these
+# on package install during the live-build, so they exist in the
+# squashfs already; every boot gets the *same* set from squashfs,
+# but the first time they reach the store we pin them.
+#
+# We check by looking for any private key file. If none, it's a
+# fresh data partition and we seed.
+if ! compgen -G "$STORE/${KEY_PATTERN}" > /dev/null; then
+    echo "nomad-ssh-keys: seeding persistent store from live system keys"
+    cp -p "$SSH_DIR"/${KEY_PATTERN} "$STORE/" 2>/dev/null || true
+    # Also copy the .pub companions
+    cp -p "$SSH_DIR"/${KEY_PATTERN}.pub "$STORE/" 2>/dev/null || true
+fi
+
+# Copy stored keys over the squashfs/live ones. This preserves
+# identity across reboots.
+if compgen -G "$STORE/${KEY_PATTERN}" > /dev/null; then
+    echo "nomad-ssh-keys: restoring persisted host keys"
+    cp -p "$STORE"/${KEY_PATTERN} "$SSH_DIR/"
+    cp -p "$STORE"/${KEY_PATTERN}.pub "$SSH_DIR/" 2>/dev/null || true
+    # Defensive: sshd refuses to start if private key permissions
+    # are wrong (group/world readable). cp -p should preserve them
+    # but if something went sideways (user touched the files), force.
+    chmod 600 "$SSH_DIR"/${KEY_PATTERN}
+    chmod 644 "$SSH_DIR"/${KEY_PATTERN}.pub 2>/dev/null || true
+fi
+
+echo "nomad-ssh-keys: complete"

@@ -1,0 +1,24 @@
+[Unit]
+Description=Initialize Project Nomad on first boot (load docker images)
+Requires=nomad-mount.service docker.service
+After=nomad-mount.service docker.service
+Before=nomad-start.service
+
+# Once the flag file exists, systemd marks this service as "condition
+# not met" and skips it. That's the one-shot-per-USB behavior.
+ConditionPathExists=!/mnt/nomad-data/.nomad-initialized
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# All the logic lives in the script so we can read it, edit it, and
+# keep the unit file declarative.
+ExecStart=/usr/local/sbin/nomad-init
+
+# Only touched after a successful ExecStart. If init fails, the flag
+# doesn't get written and we'll retry on next boot.
+ExecStartPost=/bin/touch /mnt/nomad-data/.nomad-initialized
+
+[Install]
+WantedBy=multi-user.target

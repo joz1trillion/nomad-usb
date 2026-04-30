@@ -1,0 +1,581 @@
+#!/bin/bash
+#
+# nomad — user-facing CLI for managing the Project Nomad stack.
+#
+# Essentially a convenience wrapper around `docker-compose` that knows
+# where the compose file lives (/mnt/nomad-data/nomad/) and exposes
+# the common operations as subcommands.
+
+set -uo pipefail
+
+NOMAD_DIR="/mnt/nomad-data/nomad"
+COMPOSE="/usr/bin/docker-compose"
+STATUS_FILE="/run/nomad-status"
+
+# Most subcommands invoke docker; that usually requires root unless
+# the user is in the docker group. We call sudo ourselves when needed
+# rather than requiring the user to remember.
+need_sudo() {
+    if [ "$(id -u)" -ne 0 ] && ! groups | grep -qw docker; then
+        echo "nomad: you need to run this as root or be in the docker group" >&2
+        exit 1
+    fi
+}
+
+# Common preamble for subcommands that need to invoke compose.
+cd_nomad() {
+    if [ ! -d "$NOMAD_DIR" ]; then
+        echo "nomad: $NOMAD_DIR not found — is NOMAD_DATA mounted?" >&2
+        exit 1
+    fi
+    if [ ! -f "$NOMAD_DIR/docker-compose.yml" ]; then
+        echo "nomad: $NOMAD_DIR/docker-compose.yml not found" >&2
+        exit 1
+    fi
+    cd "$NOMAD_DIR"
+}
+
+# Find which users can/should run docker. When invoked by the nomad
+# user via sudo, `sudo -u nomad docker ps` has a different environment
+# than running it directly. We just always use sudo for docker calls
+# inside this wrapper to sidestep group-membership quirks.
+dc() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$COMPOSE" "$@"
+    else
+        sudo "$COMPOSE" "$@"
+    fi
+}
+
+# ---- status reporting helpers ----
+# All three status-flavored commands (status, watch, wait) share the
+# same source of truth: /run/nomad-status written by nomad-init and
+# nomad-start. Centralize the read+format here so the subcommands
+# just consume the result.
+
+# Emit the current phase as-is ("ready", "failed", or a progress msg).
+# Empty string if the file doesn't exist yet (very early boot).
+get_phase() {
+    if [ -r "$STATUS_FILE" ]; then
+        cat "$STATUS_FILE" 2>/dev/null
+    fi
+}
+
+# Emit a human-readable one-line summary of the phase, with color
+# codes if stdout is a TTY.
+format_phase() {
+    local phase="$1"
+    local use_color="${2:-0}"
+    local reset="" green="" yellow="" red=""
+    if [ "$use_color" = "1" ]; then
+        reset=$'\e[0m'
+        green=$'\e[32m'
+        yellow=$'\e[33m'
+        red=$'\e[31m'
+    fi
+    case "$phase" in
+        ready)  printf '%sready%s' "$green" "$reset" ;;
+        failed) printf '%sFAILED%s (check: journalctl -u nomad-start)' "$red" "$reset" ;;
+        '')     printf '%sstarting...%s' "$yellow" "$reset" ;;
+        *)      printf '%s%s%s' "$yellow" "$phase" "$reset" ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+nomad — manage Project Nomad containers
+
+Usage:
+  nomad help                Show this help message with all commands
+  nomad status              Show current phase and container state
+  nomad watch               Live-refreshing status view (Ctrl+C to exit)
+  nomad wait                Block with a spinner until Nomad is ready
+  nomad motd                Re-display the welcome banner
+  nomad motd refresh        Clear screen, then display fresh banner
+  nomad start               Start all Nomad services
+  nomad stop                Stop all Nomad services
+  nomad restart             Restart all services (stop then start)
+  nomad logs [SERVICE]      Tail logs (all services, or one named)
+  nomad tips                Show useful tips for common issues
+  nomad pull                Pull latest container images (requires internet)
+  nomad ps                  Alias for 'status'
+  nomad compose ARGS...     Run raw docker-compose with ARGS
+
+Other useful (non-nomad) commands on this system:
+  sudo nomad-hotspot on     Start a WiFi hotspot (clients connect to laptop)
+  sudo nomad-hotspot off    Stop the hotspot
+  sudo nomad-hotspot status Show hotspot state
+  sudo connmanctl           Configure networking (WiFi join, ethernet, etc.)
+  ip -brief addr            Quick view of all network interfaces
+  docker ps                 Raw container list
+  journalctl -u nomad-start View nomad service log
+
+Service names: admin, mysql, redis, dozzle, updater (with --profile online)
+EOF
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage; exit 1; }
+shift || true
+
+case "$cmd" in
+    status|ps)
+        # One-shot status: phase + compose ps. Suitable for scripts.
+        phase=$(get_phase)
+        # Detect TTY so we only emit ANSI color when useful. Redirect
+        # target of `nomad status | grep ...` shouldn't get escapes.
+        if [ -t 1 ]; then use_color=1; else use_color=0; fi
+        printf 'Nomad: %s\n\n' "$(format_phase "$phase" "$use_color")"
+
+        # Only show compose ps if the stack has been at least started
+        # — during the initial image-load phase, compose isn't up yet
+        # and the `docker-compose ps` call just prints an empty table.
+        if [ "$phase" = "ready" ] || [ "$phase" = "failed" ] || \
+           [ -n "$phase" ] && echo "$phase" | grep -qi "compose"; then
+            cd_nomad
+            dc ps
+        else
+            echo "(compose stack not started yet)"
+        fi
+        ;;
+
+    watch)
+        # Live-refreshing status view. Redraws ~4x per second so the
+        # spinner animates smoothly. Exits on Ctrl+C.
+        #
+        # ANTI-FLICKER STRATEGY:
+        # The naive approach is `clear; print everything; sleep 1` —
+        # which blinks because between the clear and the reprint the
+        # screen is literally empty. We instead:
+        #   1. Hide the cursor (no blinking caret)
+        #   2. Move cursor to (0,0) at the start of each frame
+        #   3. Print each line followed by `tput el` (clear-to-EOL),
+        #      so trailing chars from a longer previous frame don't
+        #      ghost. We never blank the WHOLE screen.
+        # The result is butter-smooth in-place updates, like htop.
+
+        have_tput=0
+        command -v tput >/dev/null 2>&1 && have_tput=1
+        if [ "$have_tput" != "1" ]; then
+            echo "nomad watch: requires tput (install ncurses-bin)" >&2
+            exit 1
+        fi
+
+        spinner_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        frame_idx=0
+
+        cleanup() {
+            tput cnorm 2>/dev/null
+            tput cup $(($(tput lines) - 1)) 0 2>/dev/null
+            echo
+            exit 0
+        }
+        trap cleanup INT TERM
+
+        tput civis 2>/dev/null
+        clear
+
+        # ---- helpers used inside the loop ----
+        # Read a key from /run/nomad-init.state. Empty if not present.
+        get_init_state() {
+            local key="$1"
+            [ -r /run/nomad-init.state ] || return 0
+            grep "^${key}=" /run/nomad-init.state 2>/dev/null \
+                | tail -n1 | cut -d= -f2-
+        }
+
+        # Format bytes as MB or GB depending on size. Integer-only,
+        # avoids depending on `bc`.
+        fmt_bytes() {
+            local b="$1"
+            if [ "$b" -ge 1073741824 ]; then
+                # >= 1 GiB
+                printf '%d.%01d GB' $((b / 1073741824)) \
+                                    $(( (b * 10 / 1073741824) % 10 ))
+            elif [ "$b" -ge 1048576 ]; then
+                printf '%d MB' $((b / 1048576))
+            else
+                printf '%d KB' $((b / 1024))
+            fi
+        }
+
+        # Format seconds as "MmSSs" (e.g. 7m20s) or "<1s" if tiny.
+        fmt_dur() {
+            local s="$1"
+            if [ "$s" -le 0 ]; then printf '<1s'; return; fi
+            local m=$((s / 60))
+            local r=$((s % 60))
+            if [ "$m" -gt 0 ]; then
+                printf '%dm%02ds' "$m" "$r"
+            else
+                printf '%ds' "$r"
+            fi
+        }
+
+        # Draw a 30-char progress bar with N% filled. Pure ASCII for
+        # max compatibility; the visible bar is the filled portion in
+        # green, unfilled is gray.
+        bar() {
+            local pct="$1"
+            local width=30
+            local filled=$(( pct * width / 100 ))
+            [ "$filled" -gt "$width" ] && filled="$width"
+            [ "$filled" -lt 0 ] && filled=0
+            local empty=$((width - filled))
+            local b=''
+            local i=0
+            while [ "$i" -lt "$filled" ]; do b="${b}█"; i=$((i+1)); done
+            i=0
+            while [ "$i" -lt "$empty" ]; do b="${b}░"; i=$((i+1)); done
+            printf '\e[32m%s\e[0m' "$b"
+        }
+
+        # Print a line at row $1, content $2..., padded with clear-EOL
+        # so any leftover chars from longer previous frames disappear.
+        # We use %b (not %s) so ANSI escape sequences embedded in the
+        # content (\e[32m ... \e[0m) actually render as colors.
+        line() {
+            local row="$1"; shift
+            tput cup "$row" 0
+            printf '%b' "$*"
+            tput el
+        }
+
+        # ---- the main render loop ----
+        while true; do
+            spinner="${spinner_frames[$frame_idx]}"
+            frame_idx=$(( (frame_idx + 1) % ${#spinner_frames[@]} ))
+
+            phase=$(get_phase)
+            init_phase=$(get_init_state phase)
+
+            row=0
+            line $row "  Nomad Status — Ctrl+C to exit"; row=$((row+1))
+            line $row "  ───────────────────────────────────────────────────"; row=$((row+1))
+            line $row ""; row=$((row+1))
+
+            case "$init_phase" in
+                reading|unpacking)
+                    # ---- IMAGE LOAD VIEW ----
+                    # Phase 1 (reading) or phase 2 (unpacking) — both
+                    # show the progress bar and image checklist.
+                    expected=$(get_init_state expected_images)
+                    expected=${expected:-0}
+                    loaded_count=$(get_init_state loaded_count)
+                    loaded_count=${loaded_count:-0}
+                    eta_sec=$(get_init_state eta_sec)
+                    images_csv=$(get_init_state images)
+                    done_csv=$(get_init_state done_images)
+                    cur_size=$(get_init_state current_tarball_size)
+                    cur_size=${cur_size:-0}
+
+                    # Phase 1 progress bar reads the live pv bytes file.
+                    cur_bytes=0
+                    if [ -r /run/nomad-init.pv ]; then
+                        cur_bytes=$(tail -n1 /run/nomad-init.pv 2>/dev/null \
+                                    | tr -d ' \r' || echo 0)
+                        cur_bytes=${cur_bytes//[^0-9]/}
+                        cur_bytes=${cur_bytes:-0}
+                    fi
+
+                    # Decide which bar to show. While we're still in
+                    # phase 1 (pv hasn't finished reading), show bytes.
+                    # After pv hits 100%, switch to image-count bar.
+                    if [ "$init_phase" = "reading" ] && [ "$cur_size" -gt 0 ] \
+                       && [ "$cur_bytes" -lt "$cur_size" ]; then
+                        pct=$(( cur_bytes * 100 / cur_size ))
+                        line $row "  $spinner  Reading tarball into Docker"
+                        row=$((row+1))
+                        line $row "     $(bar $pct) ${pct}%  $(fmt_bytes $cur_bytes) / $(fmt_bytes $cur_size)"
+                        row=$((row+1))
+                    else
+                        # Phase 2: image-count bar
+                        if [ "$expected" -gt 0 ]; then
+                            pct=$(( loaded_count * 100 / expected ))
+                        else
+                            pct=0
+                        fi
+                        eta_str=""
+                        if [ -n "$eta_sec" ] && [ "$eta_sec" -gt 0 ]; then
+                            eta_str="  ETA $(fmt_dur $eta_sec)"
+                        fi
+                        line $row "  $spinner  Unpacking images to Docker storage"
+                        row=$((row+1))
+                        line $row "     $(bar $pct) ${pct}%  ${loaded_count}/${expected}${eta_str}"
+                        row=$((row+1))
+                    fi
+
+                    line $row ""; row=$((row+1))
+
+                    # Per-image checklist. Each image is in one of three
+                    # states:
+                    #   ✓  done       (in done_csv)
+                    #   ⠹  active     (first one not in done_csv — the
+                    #                 one docker is currently unpacking)
+                    #   ·  pending    (everything after the active one)
+                    #
+                    # We use a simple flag to mark "we've already seen
+                    # the active one this frame".
+                    IFS=',' read -ra all_imgs <<< "$images_csv"
+                    done_str=",${done_csv},"
+                    active_seen=0
+
+                    for img in "${all_imgs[@]}"; do
+                        [ -z "$img" ] && continue
+                        if [[ "$done_str" == *",${img},"* ]]; then
+                            line $row "    \e[32m✓\e[0m  $img"
+                        elif [ "$active_seen" -eq 0 ]; then
+                            line $row "    \e[33m$spinner\e[0m  $img"
+                            active_seen=1
+                        else
+                            line $row "    \e[2m·  $img\e[0m"
+                        fi
+                        row=$((row+1))
+                    done
+                    ;;
+
+                done|"")
+                    # ---- POST-INIT VIEW ----
+                    # Either init never had to run (no tarballs) or it
+                    # finished. Show the regular nomad-start phase
+                    # (compose-up retrying, ready, failed, etc.).
+                    case "$phase" in
+                        ready)
+                            line $row "  \e[32m✓\e[0m  Nomad is ready"
+                            row=$((row+1))
+                            ;;
+                        failed)
+                            line $row "  \e[31m✗\e[0m  $(format_phase "$phase" 1)"
+                            row=$((row+1))
+                            ;;
+                        *)
+                            line $row "  $spinner  $(format_phase "$phase" 1)"
+                            row=$((row+1))
+                            ;;
+                    esac
+                    line $row ""; row=$((row+1))
+
+                    if [ -d "$NOMAD_DIR" ] && [ -f "$NOMAD_DIR/docker-compose.yml" ]; then
+                        # Capture compose ps to a string and emit it
+                        # line-by-line through our line() function so
+                        # leftover characters get cleared.
+                        ps_out=$(cd "$NOMAD_DIR" && dc ps 2>/dev/null) || ps_out=""
+                        while IFS= read -r ps_line; do
+                            line $row "$ps_line"
+                            row=$((row+1))
+                        done <<< "$ps_out"
+                    fi
+                    ;;
+
+                failed)
+                    line $row "  \e[31m✗  Image load FAILED\e[0m"
+                    row=$((row+1))
+                    line $row "     Check: journalctl -u nomad-init -n 100"
+                    row=$((row+1))
+                    ;;
+
+                *)
+                    line $row "  $spinner  $init_phase"
+                    row=$((row+1))
+                    ;;
+            esac
+
+            # Clear any leftover rows from a previous (longer) frame.
+            # We track the max row we've ever rendered to know where to
+            # stop clearing.
+            max_row=${max_row:-0}
+            while [ "$row" -le "$max_row" ]; do
+                line $row ""
+                row=$((row+1))
+            done
+            max_row=$row
+
+            # Animate ~4 times per second instead of 1 — feels alive,
+            # still cheap on CPU since we're just reading a few small
+            # files from tmpfs and rewriting a screenful of text.
+            sleep 0.25
+        done
+        ;;
+
+    wait)
+        # Block until phase is `ready` or `failed`, showing a spinner
+        # and the current phase line. Useful in scripts or if you just
+        # want to start it up and come back when it's done.
+        #
+        # Optional timeout via --timeout SECONDS; default is 30 min,
+        # which comfortably covers even a slow first-boot image load.
+        timeout=1800
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --timeout) timeout="$2"; shift 2 ;;
+                *) echo "nomad wait: unknown arg '$1'" >&2; exit 2 ;;
+            esac
+        done
+
+        spinner_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        frame_idx=0
+        start_ts=$(date +%s)
+
+        # Hide cursor + trap so Ctrl+C and exits leave the terminal clean.
+        trap 'echo; [ -t 1 ] && tput cnorm 2>/dev/null; exit 130' INT TERM
+        [ -t 1 ] && tput civis 2>/dev/null
+
+        while true; do
+            phase=$(get_phase)
+            spinner="${spinner_frames[$frame_idx]}"
+            frame_idx=$(( (frame_idx + 1) % ${#spinner_frames[@]} ))
+
+            # \r + no newline = in-place redraw on the same line.
+            # \e[2K = clear the line before re-writing, so shorter
+            # phase strings don't leave trailing garbage from longer
+            # previous lines.
+            if [ -t 1 ]; then
+                printf '\r\e[2K  %s  %s' "$spinner" "$(format_phase "$phase" 1)"
+            fi
+
+            case "$phase" in
+                ready)
+                    [ -t 1 ] && printf '\r\e[2K'
+                    printf '  \e[32m✓\e[0m  Nomad is ready\n'
+                    [ -t 1 ] && tput cnorm 2>/dev/null
+                    exit 0
+                    ;;
+                failed)
+                    [ -t 1 ] && printf '\r\e[2K'
+                    printf '  \e[31m✗\e[0m  Nomad failed to start\n'
+                    printf '     Check: journalctl -u nomad-start -n 100\n'
+                    [ -t 1 ] && tput cnorm 2>/dev/null
+                    exit 1
+                    ;;
+            esac
+
+            now=$(date +%s)
+            if [ $((now - start_ts)) -ge "$timeout" ]; then
+                [ -t 1 ] && printf '\r\e[2K'
+                printf '  \e[33m!\e[0m  Timeout after %ss. Last phase: %s\n' \
+                    "$timeout" "$phase"
+                [ -t 1 ] && tput cnorm 2>/dev/null
+                exit 2
+            fi
+
+            sleep 1
+        done
+        ;;
+
+    motd)
+        # Re-display the welcome banner. Useful after a `nomad watch`
+        # session where the user has forgotten the command list, or
+        # after bringing up new network interfaces (ethernet, hotspot)
+        # to see the updated IP addresses.
+        #
+        # Subcommand:
+        #   nomad motd            — print banner below current output
+        #   nomad motd refresh    — clear screen first, then print banner
+        #
+        # NOMAD_BANNER_FORCE=1 tells the banner script to bypass its
+        # once-per-shell guard so it actually prints something even
+        # though we already saw it at login.
+        sub="${2:-}"
+        if [ "$sub" = "refresh" ]; then
+            # tput clear is friendlier than `clear` because it also
+            # works on TTYs without a TERM env var set.
+            if command -v tput >/dev/null 2>&1; then
+                tput clear
+            else
+                clear 2>/dev/null || printf '\ec'
+            fi
+        fi
+        if [ -r /etc/profile.d/nomad-banner.sh ]; then
+            NOMAD_BANNER_FORCE=1 bash /etc/profile.d/nomad-banner.sh
+        else
+            echo "nomad: banner script not found at /etc/profile.d/nomad-banner.sh" >&2
+            exit 1
+        fi
+        ;;
+
+    tips)
+        # Static list of known-issue tips + workarounds. Easier than
+        # training users to find the right forum post.
+        cat <<'EOF'
+Nomad tips & known issues
+─────────────────────────
+
+Offline: "Install" button greyed out in the Command Center
+    The admin UI currently checks connectivity before enabling the
+    Install button, even when the image is already present locally.
+    Workaround: click "Force Reinstall" instead. It skips the online
+    check and uses the pre-loaded image. You only need to do this
+    once per app — after that, the app stays installed across reboots.
+
+mysql takes a long time on first boot
+    Expected. MySQL 8 initializes its data directory the first time
+    it starts, and on USB-backed storage that can take 1-2 minutes.
+    Subsequent boots are fast.
+
+First boot takes 20+ minutes
+    Also expected. `docker load` has to unpack several GB of image
+    layers from /mnt/nomad-data/images/nomad.tar onto the USB. This
+    is unavoidably slow on USB flash. Only happens on the VERY first
+    boot of a freshly-flashed drive.
+
+    Watch progress with: nomad watch   (or: nomad wait)
+
+Can't reach Nomad on the network
+    Check your IP:            ip -brief addr
+    Check that Nomad is up:   nomad status
+    If status isn't 'ready':  nomad wait
+    If wait fails:            journalctl -u nomad-start -n 100
+
+Network config
+    ConnMan is the network manager. Configure with:
+      sudo connmanctl
+    Common: `sudo connmanctl enable wifi` then `agent on` and
+    `scan wifi`, `services`, `connect <service-id>`.
+
+SSH "host key changed" warning after reflash
+    Known. The live system regenerates SSH host keys on boot until
+    the persistent-key fix lands. For now:
+      ssh-keygen -R <ip-or-hostname>
+    then reconnect.
+EOF
+        ;;
+    start|up)
+        cd_nomad
+        dc up -d --remove-orphans
+        ;;
+    stop|down)
+        cd_nomad
+        dc down
+        ;;
+    restart)
+        cd_nomad
+        dc down
+        dc up -d --remove-orphans
+        ;;
+    logs)
+        cd_nomad
+        # Pass through remaining args so `nomad logs -f admin` works.
+        if [ $# -eq 0 ]; then
+            dc logs --tail=200 -f
+        else
+            dc logs --tail=200 -f "$@"
+        fi
+        ;;
+    pull)
+        cd_nomad
+        dc pull
+        ;;
+    compose)
+        # Escape hatch: `nomad compose <any args>` for power users.
+        cd_nomad
+        dc "$@"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "nomad: unknown subcommand '$cmd'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

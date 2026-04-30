@@ -1,0 +1,8 @@
+# Using Debian's packaged Docker (docker.io) rather than Docker CE.
+# Simpler: no external repo, no GPG key dance during the build.
+# Slightly older than upstream but perfectly fine for Nomad.
+#
+# docker-compose provides the `docker compose` subcommand plugin.
+
+docker.io
+docker-compose

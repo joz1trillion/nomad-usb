@@ -1,0 +1,323 @@
+#!/bin/bash
+#
+# nomad-hotspot — turn the box into a WiFi access point, or back off.
+#
+# Usage:
+#   sudo nomad-hotspot on [IFACE]       enable (IFACE auto-detected if not given)
+#   sudo nomad-hotspot off              disable, restore ConnMan management
+#   sudo nomad-hotspot status           show current state
+#
+# Strategy:
+#   1. Pick a wireless interface (user arg > first wifi device found)
+#   2. Tell ConnMan to stop touching that interface
+#   3. Bring the interface up with a static IP (192.168.77.1/24)
+#   4. Start hostapd (AP service) and dnsmasq (DHCP for clients)
+#   5. If there's a separate uplink (ethernet), NAT hotspot traffic through it
+#
+# Off:  reverse of the above, let ConnMan reclaim the interface.
+#
+# Defaults live in /etc/nomad/hotspot.conf — if that file doesn't
+# exist, we write one with sane defaults the first time the user
+# runs `on`. They can edit it to change SSID/password/channel.
+
+set -euo pipefail
+
+HOTSPOT_CONF="/etc/nomad/hotspot.conf"
+HOSTAPD_CONF="/etc/nomad/hostapd.conf"
+DNSMASQ_CONF="/etc/nomad/dnsmasq-hotspot.conf"
+STATE_FILE="/run/nomad-hotspot.state"
+
+# -------- config defaults --------
+DEFAULT_SSID="NomadNet"
+DEFAULT_PSK="nomad1234"  # 8 chars min for WPA2
+DEFAULT_CHANNEL=6
+DEFAULT_IP="192.168.77.1"
+DEFAULT_CIDR="24"
+DEFAULT_DHCP_RANGE="192.168.77.10,192.168.77.100,12h"
+
+# If HOTSPOT_CONF doesn't exist yet, create it on-demand so users
+# have something to edit. We do this lazily in `on` rather than at
+# package install so the file lives on the RAM overlay (editable)
+# rather than being baked into squashfs (read-only).
+ensure_conf() {
+    mkdir -p "$(dirname "$HOTSPOT_CONF")"
+    if [ ! -f "$HOTSPOT_CONF" ]; then
+        cat > "$HOTSPOT_CONF" <<EOF
+# Nomad hotspot configuration — edit to taste, then run
+# 'sudo nomad-hotspot off; sudo nomad-hotspot on' to apply.
+SSID="$DEFAULT_SSID"
+PSK="$DEFAULT_PSK"
+CHANNEL=$DEFAULT_CHANNEL
+HOTSPOT_IP="$DEFAULT_IP"
+HOTSPOT_CIDR="$DEFAULT_CIDR"
+DHCP_RANGE="$DEFAULT_DHCP_RANGE"
+EOF
+        chmod 600 "$HOTSPOT_CONF"  # PSK inside, don't world-read
+    fi
+    # shellcheck disable=SC1090
+    . "$HOTSPOT_CONF"
+}
+
+# -------- helpers --------
+# Make sure the WiFi radio is actually usable. Two ways the radio
+# can be off when we get here:
+#
+#   - "soft block" — the kernel rfkill subsystem has it disabled.
+#     This is what you get on a fresh boot of a laptop where WiFi
+#     was off when shut down, or after `rfkill block wifi`. Easy
+#     to fix from software.
+#
+#   - "hard block" — a physical switch or Fn-key has the radio
+#     off. We can't fix this from software; the user has to flip
+#     the switch. We can detect it and tell them.
+#
+# We don't ship `rfkill` in the live image (small, but every byte
+# in the squashfs is one we have to defend). Instead we use what's
+# already there: `connmanctl enable wifi` does the same soft-unblock
+# for any rfkill-controlled wireless device that ConnMan knows about,
+# AND it powers the technology on at the ConnMan level (which is
+# also required — even an unblocked radio won't be visible to `iw
+# dev` until ConnMan has it powered on).
+#
+# We do this BEFORE trying to find the interface, because find_wifi_iface
+# uses `iw dev` which returns nothing if the radio is off.
+unblock_wifi() {
+    # Try rfkill first if it happens to be installed (small image
+    # tweaks may add it later). Errors are swallowed because a
+    # missing rfkill subsystem is harmless.
+    if command -v rfkill >/dev/null 2>&1; then
+        rfkill unblock wifi 2>/dev/null || true
+    fi
+
+    # Then ask ConnMan to power on its WiFi technology. This handles
+    # both rfkill soft-blocks AND the case where the driver is loaded
+    # but the technology is administratively disabled in ConnMan.
+    # We grep first to avoid emitting "Error wifi: Already enabled"
+    # noise, which clutters the console for no reason.
+    if command -v connmanctl >/dev/null 2>&1; then
+        local powered
+        powered=$(connmanctl technologies 2>/dev/null \
+                  | awk '/^\/net\/connman\/technology\/wifi/{wifi=1; next}
+                         wifi && /Powered/{print $3; exit}')
+        if [ "$powered" != "True" ]; then
+            connmanctl enable wifi >/dev/null 2>&1 || true
+            # Give the kernel a moment to bring the interface up
+            # after enable — `iw dev` immediately afterwards can
+            # still come back empty otherwise.
+            sleep 1
+        fi
+    fi
+}
+
+find_wifi_iface() {
+    # First interface listed as wireless by iw. Won't match devices
+    # without a driver loaded, which is fine — nothing we could do.
+    iw dev 2>/dev/null | awk '/Interface/{print $2; exit}'
+}
+
+find_uplink_iface() {
+    # The interface the default route goes out on — useful for NAT.
+    # Skip if the uplink IS the wireless interface (e.g. WiFi is
+    # our only network and we'd be "hotspotting" our own upstream).
+    ip -4 route show default 2>/dev/null \
+        | awk '/^default/{print $5; exit}'
+}
+
+# -------- commands --------
+cmd_status() {
+    if [ -f "$STATE_FILE" ]; then
+        echo "Hotspot: ACTIVE"
+        # shellcheck disable=SC1090
+        . "$STATE_FILE"
+        echo "  Interface:   ${IFACE:-unknown}"
+        echo "  SSID:        ${SSID:-unknown}"
+        echo "  Hotspot IP:  ${HOTSPOT_IP:-unknown}"
+        echo "  Uplink NAT:  ${UPLINK:-none}"
+    else
+        echo "Hotspot: inactive"
+    fi
+}
+
+cmd_on() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "nomad-hotspot on: must be root" >&2
+        exit 1
+    fi
+
+    if [ -f "$STATE_FILE" ]; then
+        echo "Hotspot already running. Run 'nomad-hotspot off' first." >&2
+        exit 1
+    fi
+
+    ensure_conf
+
+    # Make sure the radio is on before we try to find an interface.
+    # Without this, hotspot fails on first-boot of laptops where
+    # WiFi was off at shutdown, with the unhelpful "no wireless
+    # interface found" error.
+    unblock_wifi
+
+    local iface="${1:-}"
+    if [ -z "$iface" ]; then
+        iface=$(find_wifi_iface || true)
+    fi
+    if [ -z "$iface" ]; then
+        echo "nomad-hotspot on: no wireless interface found" >&2
+        echo "" >&2
+        echo "Possible causes:" >&2
+        echo "  1. WiFi is hard-blocked (physical switch or Fn-key on laptop)" >&2
+        echo "  2. No WiFi hardware in this machine" >&2
+        echo "  3. WiFi driver not loaded — check 'dmesg | grep -i wifi'" >&2
+        echo "" >&2
+        echo "If you have a WiFi switch on the laptop, flip it on, then retry." >&2
+        exit 1
+    fi
+
+    echo "Using wireless interface: $iface"
+
+    # Step 1: tell ConnMan to ignore this interface. Without this
+    # step ConnMan fights us for control (assigns its own IP,
+    # overrides routes, etc.). We do it by adding the interface
+    # NAME to the blacklist. ConnMan's main.conf already blacklists
+    # many interface patterns; we append the iface name explicitly.
+    if ! grep -q "NetworkInterfaceBlacklist=.*\b$iface\b" /etc/connman/main.conf; then
+        sed -i "s/^NetworkInterfaceBlacklist=.*$/&,$iface/" /etc/connman/main.conf
+    fi
+    systemctl restart connman
+
+    # Step 2: bring the iface up with our static IP.
+    ip link set "$iface" down
+    # Flush any stale addresses ConnMan may have put there.
+    ip addr flush dev "$iface" || true
+    ip link set "$iface" up
+    ip addr add "$HOTSPOT_IP/$HOTSPOT_CIDR" dev "$iface"
+
+    # Step 3: write hostapd + dnsmasq configs tailored to this interface.
+    cat > "$HOSTAPD_CONF" <<EOF
+interface=$iface
+driver=nl80211
+ssid=$SSID
+hw_mode=g
+channel=$CHANNEL
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_passphrase=$PSK
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+# Disable 802.11n/ac for broader client compatibility. Users can
+# edit this file and restart the hotspot to enable faster modes.
+EOF
+    chmod 600 "$HOSTAPD_CONF"
+
+    cat > "$DNSMASQ_CONF" <<EOF
+interface=$iface
+bind-interfaces
+dhcp-range=$DHCP_RANGE
+# Use our hotspot IP as the DNS server — clients can resolve
+# hosts via the systemd-resolved stub on the host.
+dhcp-option=6,$HOTSPOT_IP
+EOF
+
+    # Step 4: Start hostapd and dnsmasq as transient units pointing
+    # at our config files. Transient (systemd-run) means they go
+    # away cleanly on 'off' without leaving /etc/systemd state.
+    systemd-run --unit=nomad-hostapd --description="Nomad Hotspot hostapd" \
+        /usr/sbin/hostapd "$HOSTAPD_CONF"
+    systemd-run --unit=nomad-dnsmasq --description="Nomad Hotspot dnsmasq" \
+        /usr/sbin/dnsmasq --keep-in-foreground --conf-file="$DNSMASQ_CONF"
+
+    # Step 5: NAT hotspot traffic if there's an uplink.
+    local uplink
+    uplink=$(find_uplink_iface || true)
+    # Don't NAT through ourselves.
+    if [ "$uplink" = "$iface" ]; then
+        uplink=""
+    fi
+    if [ -n "$uplink" ]; then
+        echo "Enabling NAT: $iface -> $uplink"
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        iptables -t nat -A POSTROUTING -o "$uplink" -j MASQUERADE
+        iptables -A FORWARD -i "$iface" -o "$uplink" -j ACCEPT
+        iptables -A FORWARD -i "$uplink" -o "$iface" \
+            -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+
+    # Record state for status / off. This file living in /run means
+    # it evaporates on reboot — which is intentional, hotspot state
+    # shouldn't persist across reboots by default.
+    cat > "$STATE_FILE" <<EOF
+IFACE="$iface"
+SSID="$SSID"
+HOTSPOT_IP="$HOTSPOT_IP"
+UPLINK="${uplink:-}"
+EOF
+
+    echo
+    echo "Hotspot is up."
+    echo "  SSID:     $SSID"
+    echo "  Password: $PSK"
+    echo "  Host IP:  $HOTSPOT_IP"
+    [ -n "$uplink" ] && echo "  Internet: via $uplink (NAT)" || echo "  Internet: none"
+}
+
+cmd_off() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "nomad-hotspot off: must be root" >&2
+        exit 1
+    fi
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "Hotspot is not running."
+        return 0
+    fi
+
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+
+    # Tear down transient units if they're running.
+    systemctl stop nomad-hostapd.service 2>/dev/null || true
+    systemctl stop nomad-dnsmasq.service 2>/dev/null || true
+    systemctl reset-failed nomad-hostapd.service 2>/dev/null || true
+    systemctl reset-failed nomad-dnsmasq.service 2>/dev/null || true
+
+    # Undo NAT rules.
+    if [ -n "${UPLINK:-}" ]; then
+        iptables -t nat -D POSTROUTING -o "$UPLINK" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$IFACE" -o "$UPLINK" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$UPLINK" -o "$IFACE" \
+            -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        sysctl -w net.ipv4.ip_forward=0 >/dev/null
+    fi
+
+    # Flush the hotspot IP so the interface is ready for ConnMan
+    # to DHCP on it afresh.
+    ip addr flush dev "$IFACE" || true
+    ip link set "$IFACE" down || true
+
+    # Remove our blacklist entry so ConnMan can manage the interface again.
+    sed -i "s/,$IFACE$//" /etc/connman/main.conf
+    systemctl restart connman
+
+    rm -f "$STATE_FILE"
+    rm -f "$HOSTAPD_CONF" "$DNSMASQ_CONF"
+
+    echo "Hotspot stopped. ConnMan is now managing $IFACE again."
+}
+
+case "${1:-}" in
+    on)     shift; cmd_on "$@" ;;
+    off)    cmd_off ;;
+    status) cmd_status ;;
+    *)
+        cat <<EOF
+Usage: nomad-hotspot {on [IFACE] | off | status}
+
+  on [IFACE]   Enable hotspot. If IFACE not given, auto-detects.
+  off          Disable hotspot, return interface to ConnMan.
+  status       Show current hotspot state.
+
+Config: $HOTSPOT_CONF (created on first 'on')
+EOF
+        exit 1
+        ;;
+esac

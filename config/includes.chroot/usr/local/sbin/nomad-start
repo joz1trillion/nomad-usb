@@ -1,0 +1,74 @@
+#!/bin/bash
+#
+# nomad-start: bring up the Nomad compose stack, retrying on failure.
+#
+# WHY: `docker-compose up -d --remove-orphans` can fail transiently on
+# first boot if mysql's fresh-DB initialization exceeds the compose
+# dependency-healthcheck tolerance (~90s default). The admin container
+# has `depends_on: mysql: condition: service_healthy`, and if mysql
+# isn't healthy by the time compose's timer expires, compose gives up
+# — but docker is now left with a mysql container that becomes healthy
+# seconds later and an admin container stuck in `Created` state forever.
+#
+# The fix: if the first attempt fails, sleep a minute (mysql finishes
+# initializing in the background) and try again. On the retry, mysql
+# is already healthy, all depends_on conditions pass, admin starts.
+#
+# Progress: we write status updates to both the journal and the
+# attached console (/dev/tty1), plus /run/nomad-status so other
+# tooling (MOTD, `nomad status`) can read the current phase.
+
+set -u
+
+STATUS_FILE="/run/nomad-status"
+
+say() {
+    local msg="$1"
+    echo "[nomad-start] $msg"
+    echo "$msg" > "$STATUS_FILE" 2>/dev/null || true
+}
+
+cd /mnt/nomad-data/nomad
+
+MAX_ATTEMPTS=5
+ATTEMPT=1
+SLEEP_SEC=60
+
+say "starting Nomad compose stack"
+
+while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+    say "compose-up attempt $ATTEMPT of $MAX_ATTEMPTS"
+    if /usr/bin/docker-compose up -d --remove-orphans; then
+        say "compose-up succeeded"
+
+        # Grab the IP so the success message includes the URL people
+        # can actually visit. Fall back to a hostname-based URL if
+        # we can't find an IP (unusual but possible on an air-gapped
+        # laptop with no link).
+        ip=$(ip -4 -o addr show scope global 2>/dev/null \
+             | awk '{print $4}' | cut -d/ -f1 | head -n1)
+        if [ -n "$ip" ]; then
+            say "Nomad is ready at http://${ip}:8080"
+        else
+            say "Nomad is ready on port 8080"
+        fi
+        # One final status file value that other tools can check for
+        # the "all done" state specifically.
+        echo "ready" > "$STATUS_FILE" 2>/dev/null || true
+        exit 0
+    fi
+
+    say "compose-up failed on attempt $ATTEMPT"
+
+    # Don't sleep after the last failed attempt.
+    if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+        say "waiting ${SLEEP_SEC}s for mysql to finish initializing, then retrying"
+        sleep $SLEEP_SEC
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+done
+
+say "all $MAX_ATTEMPTS attempts failed — check 'docker ps -a' and 'docker logs nomad_mysql' to diagnose"
+echo "failed" > "$STATUS_FILE" 2>/dev/null || true
+exit 1

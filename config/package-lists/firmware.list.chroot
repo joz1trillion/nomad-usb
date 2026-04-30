@@ -1,0 +1,21 @@
+# Firmware for broad hardware compatibility. "Business PC or laptop"
+# is the target, so we prioritize common WiFi chipsets (Intel, Realtek,
+# Atheros, Broadcom) and CPU microcode for both major vendors.
+#
+# This adds ~200MB to the ISO but dramatically improves "plug it in
+# and it just works" odds on random machines.
+
+firmware-linux
+firmware-linux-nonfree
+firmware-linux-free
+firmware-misc-nonfree
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+firmware-brcm80211
+firmware-ralink
+firmware-libertas
+firmware-ti-connectivity
+firmware-zd1211
+intel-microcode
+amd64-microcode

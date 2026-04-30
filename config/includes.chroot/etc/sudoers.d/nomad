@@ -1,0 +1,4 @@
+# NOPASSWD is fine here: the system ships with a known default
+# password, so requiring it for sudo adds exactly zero security.
+# Users who harden the system should tighten this too.
+nomad ALL=(ALL) NOPASSWD:ALL

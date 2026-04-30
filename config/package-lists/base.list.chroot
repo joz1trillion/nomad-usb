@@ -1,0 +1,36 @@
+# Base utilities on top of what live-build installs by default.
+# Keep this list lean — if a package isn't actually useful on a
+# headless server, leave it out.
+
+bash-completion
+vim
+nano
+less
+htop
+curl
+wget
+git
+openssh-server
+sudo
+ca-certificates
+lsb-release
+gnupg
+rsync
+parted
+e2fsprogs
+dosfstools
+file
+tree
+jq
+tmux
+
+# Progress-reporting utilities used by nomad-init / nomad status:
+#   pv          — Pipe Viewer; shows a live bytes-processed progress
+#                 bar when piping tarballs into `docker load`. Without
+#                 this, first-boot image loading looks like the
+#                 system is frozen for 15-20 minutes.
+#   ncurses-bin — Provides `tput`, which the `nomad watch` command
+#                 uses for cursor positioning and screen clearing
+#                 so the live-refreshing view doesn't flicker.
+pv
+ncurses-bin

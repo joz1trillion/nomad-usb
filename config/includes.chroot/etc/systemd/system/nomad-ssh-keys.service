@@ -1,0 +1,18 @@
+[Unit]
+Description=Persist SSH host keys on NOMAD_DATA partition
+# Must run after the data partition is mounted but before ssh starts
+# (so ssh picks up the persisted keys, not the fresh per-boot ones).
+Requires=nomad-mount.service
+After=nomad-mount.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nomad-ssh-keys
+
+[Install]
+# ssh.service's WantedBy drags this in via Before=. We still want it
+# in the boot target explicitly so it runs even if something is
+# starting ssh by hand.
+WantedBy=multi-user.target

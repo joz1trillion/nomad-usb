@@ -1,0 +1,330 @@
+/*
+ * nomad-flash — wizard styles.
+ *
+ * Aim: clean, dark, no-nonsense. The user is about to wipe a USB
+ * drive — the UI should feel deliberate and serious, not flashy.
+ */
+
+:root {
+    --bg:        #0d1117;
+    --bg-card:   #161b22;
+    --bg-elev:  #1f242c;
+    --border:   #30363d;
+    --text:     #c9d1d9;
+    --text-dim: #8b949e;
+    --accent:   #00ff88;
+    --warn:     #ffa657;
+    --danger:   #f85149;
+    --radius:   8px;
+    --gap:      1rem;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    min-height: 100vh;
+}
+
+#app {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+}
+
+.loading {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 4rem 0;
+}
+
+/* ---------- header ---------- */
+.header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 2rem;
+}
+.header h1 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+}
+.header .version {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+}
+
+/* ---------- step indicator ---------- */
+.steps {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 2rem;
+}
+.steps .step {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    transition: background 0.2s;
+}
+.steps .step.done    { background: var(--accent); }
+.steps .step.current { background: var(--text); }
+
+/* ---------- card ---------- */
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: var(--gap);
+}
+.card h2 {
+    margin: 0 0 0.75rem 0;
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+.card p {
+    margin: 0 0 1rem 0;
+    color: var(--text-dim);
+}
+
+/* ---------- form elements ---------- */
+label {
+    display: block;
+    margin-bottom: 0.35rem;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+}
+input[type="text"], select {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-elev);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.95rem;
+}
+input[type="text"]:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* ---------- buttons ---------- */
+.actions {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--gap);
+    margin-top: 1.5rem;
+}
+button {
+    padding: 0.6rem 1.25rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-elev);
+    color: var(--text);
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+button:hover:not(:disabled) {
+    background: var(--bg-card);
+    border-color: var(--text-dim);
+}
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+button.primary {
+    background: var(--accent);
+    color: #000;
+    border-color: var(--accent);
+    font-weight: 600;
+}
+button.primary:hover:not(:disabled) {
+    background: #00cc6e;
+    border-color: #00cc6e;
+}
+button.danger {
+    background: var(--danger);
+    color: #000;
+    border-color: var(--danger);
+    font-weight: 600;
+}
+button.danger:hover:not(:disabled) {
+    background: #c93e34;
+}
+
+/* ---------- split button (action + dropdown arrow) ---------- */
+.split-btn {
+    position: relative;
+    display: inline-flex;
+}
+.split-btn-main {
+    /* Right-attached: square the right side so it meets the arrow flush */
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    border-right: none;
+}
+.split-btn-arrow {
+    /* Left-attached: square the left side, narrower than a normal button */
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    padding: 0.6rem 0.5rem;
+    font-size: 0.75rem;
+}
+.split-btn-menu {
+    /* Hidden by default — shown when the .split-btn parent gets .open */
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 100%;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem;
+    z-index: 50;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    flex-direction: column;
+    gap: 0.15rem;
+    /* whitespace: nowrap stops the menu items from wrapping awkwardly */
+    white-space: nowrap;
+}
+.split-btn.open .split-btn-menu {
+    display: flex;
+}
+
+/* ---------- optional apps checkbox list ---------- */
+.apps-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.85rem;
+}
+.apps-toolbar .link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+.apps-toolbar .link-btn:hover {
+    color: var(--text);
+}
+.apps-toolbar .toolbar-sep {
+    color: var(--text-dim);
+}
+
+.app-row {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 0.5rem;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+.app-row:hover { border-color: var(--text-dim); }
+.app-row input[type="checkbox"] {
+    /* Make the box a sensible size; the default browser one is tiny */
+    width: 1.1rem;
+    height: 1.1rem;
+    margin-top: 0.2rem;
+    cursor: pointer;
+    accent-color: var(--accent);
+}
+.app-meta { flex: 1; }
+.app-name {
+    font-weight: 600;
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+}
+.app-size {
+    font-weight: 400;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+}
+.app-desc {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin-top: 0.25rem;
+}
+.split-btn-menu button {
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    background: transparent;
+}
+.split-btn-menu button:hover:not(:disabled) {
+    background: var(--bg-elev);
+    border-color: var(--border);
+}
+
+/* ---------- device list ---------- */
+.device-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.device {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+.device:hover { border-color: var(--text-dim); }
+.device.selected { border-color: var(--accent); }
+.device .name { font-weight: 600; min-width: 6rem; }
+.device .meta { color: var(--text-dim); font-size: 0.85rem; flex: 1; }
+.device .removable {
+    font-size: 0.75rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    background: var(--bg-card);
+    color: var(--text-dim);
+}
+.device .removable.yes { color: var(--accent); }
+
+/* ---------- progress ---------- */
+.log {
+    background: #000;
+    color: #b9c0c8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    padding: 1rem;
+    border-radius: 6px;
+    height: 280px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+
+/* ---------- alert / notice ---------- */
+.alert {
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    margin-bottom: var(--gap);
+    border: 1px solid;
+}
+.alert.warn   { border-color: var(--warn);   background: rgba(255,166,87,0.08);  color: var(--warn); }
+.alert.danger { border-color: var(--danger); background: rgba(248,81,73,0.08);   color: var(--danger); }

@@ -1,0 +1,19 @@
+# ConnMan is our network manager (this is what the previous build
+# settled on). It plays nicely with Docker's veth interfaces once
+# we blacklist them in main.conf — see includes.chroot/etc/connman/
+#
+# wpasupplicant is pulled in by ConnMan for WiFi.
+
+connman
+wpasupplicant
+wireless-regdb
+iw
+net-tools
+iproute2
+iputils-ping
+dnsutils
+ethtool
+# iptables is pulled in by docker (docker.io) already, but list here
+# explicitly because nomad-hotspot uses it for NAT rules and we
+# shouldn't rely on a transitive dependency.
+iptables

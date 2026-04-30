@@ -1,0 +1,41 @@
+[Unit]
+Description=Project Nomad first-boot setup UI (full-screen on tty1)
+Documentation=https://github.com/Crosstalk-Solutions/project-nomad
+# Runs only on the very first boot of a freshly-flashed USB. We
+# detect "first boot" via the absence of /mnt/nomad-data/.nomad-initialized
+# (touched by the UI script on success).
+#
+# Order: After mount + docker (we need the data partition mounted
+# AND docker running before we can load images). Before getty so we
+# get tty1 first — getty is configured to NOT start on tty1 when
+# this unit is active (Conflicts below).
+After=nomad-mount.service docker.service
+Requires=nomad-mount.service docker.service
+Before=getty@tty1.service nomad-init.service nomad-start.service
+Conflicts=getty@tty1.service
+
+# One-shot per USB: skip if the flag exists.
+ConditionPathExists=!/mnt/nomad-data/.nomad-initialized
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+
+# Bind to tty1 so the script's stdin/stdout/stderr go straight to
+# the screen. tty-force grabs tty1 even if something else is using
+# it (e.g. the kernel was scrolling rsync output there).
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+ExecStart=/usr/local/sbin/nomad-firstboot-ui
+
+# UI reboots on success; if it returns (failure path), don't restart
+# — the user needs to be able to inspect.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

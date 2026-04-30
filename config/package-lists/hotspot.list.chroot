@@ -1,0 +1,6 @@
+# Hotspot tools — installed so they're available offline when needed,
+# but the systemd services are DISABLED in the setup hook. User has
+# to explicitly turn them on. LAN is the default posture.
+
+hostapd
+dnsmasq

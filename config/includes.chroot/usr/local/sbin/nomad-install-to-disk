@@ -1,0 +1,201 @@
+#!/bin/bash
+#
+# nomad-install-to-disk — copy the running Nomad USB system onto an
+# internal disk. Turns the "plugged-in USB" experience into a "boot
+# directly from host storage" experience. USB no longer required
+# after install.
+#
+# Strategy:
+#   1. Identify target disk (interactive picker)
+#   2. Partition target identical to the USB:
+#        p1: 512MB FAT32  EFI
+#        p2: sized to fit the squashfs  ext4  labeled NOMAD_LIVE
+#        p3: rest         ext4  labeled NOMAD_DATA
+#   3. Copy the live-media content onto p2
+#   4. rsync NOMAD_DATA (including docker data-root) onto p3
+#   5. Install GRUB with a menu entry pointing at the squashfs on p2
+#
+# This is terminal-only, guided, and destructive.
+
+set -euo pipefail
+
+# -------- preflight --------
+if [ "$(id -u)" -ne 0 ]; then
+    echo "nomad-install-to-disk: must be run as root (use sudo)" >&2
+    exit 1
+fi
+
+# Must be running from the live USB — the install pulls from /run/live.
+if [ ! -d /run/live/medium ]; then
+    echo "nomad-install-to-disk: /run/live/medium not present" >&2
+    echo "This tool must be run while booted from the Nomad USB." >&2
+    exit 1
+fi
+
+# NOMAD_DATA must be mounted (normal boot state).
+if ! mountpoint -q /mnt/nomad-data; then
+    echo "nomad-install-to-disk: /mnt/nomad-data not mounted" >&2
+    exit 1
+fi
+
+# Required tools.
+for tool in lsblk sgdisk mkfs.ext4 mkfs.vfat rsync grub-install partprobe blkid; do
+    if ! command -v "$tool" >/dev/null; then
+        echo "nomad-install-to-disk: missing required tool '$tool'" >&2
+        exit 1
+    fi
+done
+
+# -------- target selection --------
+echo
+echo "=== Nomad install-to-disk ==="
+echo
+echo "This will DESTROY ALL DATA on the target disk and install Nomad."
+echo
+echo "Available disks:"
+# Only show disks, not partitions or loop devices. Skip the live USB
+# if we can identify it (it has the live ISO mounted).
+LIVE_DEV=""
+if [ -L /run/live/medium ] || mountpoint -q /run/live/medium; then
+    # The medium mount's source is e.g. /dev/sda2 — strip to /dev/sda
+    src=$(findmnt -n -o SOURCE /run/live/medium 2>/dev/null || true)
+    if [ -n "$src" ]; then
+        LIVE_DEV=$(lsblk -no PKNAME "$src" 2>/dev/null || true)
+        [ -n "$LIVE_DEV" ] && LIVE_DEV="/dev/$LIVE_DEV"
+    fi
+fi
+
+lsblk -dno NAME,SIZE,MODEL,TRAN | while read -r line; do
+    name=$(echo "$line" | awk '{print $1}')
+    [ "/dev/$name" = "$LIVE_DEV" ] && continue  # skip the live USB
+    [[ "$name" == loop* || "$name" == sr* ]] && continue
+    echo "  /dev/$line"
+done
+echo
+[ -n "$LIVE_DEV" ] && echo "(skipping $LIVE_DEV — that's the USB you booted from)"
+echo
+read -r -p "Target disk (e.g. /dev/sdb, /dev/nvme0n1): " TARGET
+if [ ! -b "$TARGET" ]; then
+    echo "Not a block device: $TARGET" >&2
+    exit 1
+fi
+if [ "$TARGET" = "$LIVE_DEV" ]; then
+    echo "Refusing to install onto the live USB itself." >&2
+    exit 1
+fi
+
+echo
+lsblk "$TARGET"
+echo
+echo "ALL DATA on $TARGET will be destroyed."
+read -r -p "Type 'YES' (all caps, exactly) to continue: " confirm
+[ "$confirm" = "YES" ] || { echo "Aborted."; exit 0; }
+
+# -------- partition --------
+echo
+echo ">>> Partitioning $TARGET"
+
+# Wipe any existing partition table so sgdisk starts clean.
+sgdisk --zap-all "$TARGET"
+
+# Sizing: p1 EFI 512MB, p2 sized for squashfs + headroom, p3 fills rest.
+# The live squashfs is usually 1.5-3GB; give 6GB so a few ISO swaps
+# over the lifetime of the install don't need repartitioning.
+sgdisk \
+    --new=1:0:+512M    --typecode=1:EF00 --change-name=1:EFI \
+    --new=2:0:+6G      --typecode=2:8300 --change-name=2:NOMAD_LIVE \
+    --new=3:0:0        --typecode=3:8300 --change-name=3:NOMAD_DATA \
+    "$TARGET"
+
+partprobe "$TARGET"; sleep 2
+
+# Resolve partition device names (sda1 vs nvme0n1p1).
+if [[ "$TARGET" =~ [0-9]$ ]]; then
+    P1="${TARGET}p1"; P2="${TARGET}p2"; P3="${TARGET}p3"
+else
+    P1="${TARGET}1"; P2="${TARGET}2"; P3="${TARGET}3"
+fi
+
+echo ">>> Formatting partitions"
+mkfs.vfat -F32 -n EFI "$P1"
+mkfs.ext4 -F -L NOMAD_LIVE "$P2"
+mkfs.ext4 -F -L NOMAD_DATA "$P3"
+
+# -------- copy live media onto p2 --------
+echo ">>> Copying live system from USB to $P2"
+LIVE_MNT=$(mktemp -d)
+mount "$P2" "$LIVE_MNT"
+# /run/live/medium is where the live USB's ISO partition is mounted.
+# It contains /live/vmlinuz, /live/initrd.img, /live/filesystem.squashfs
+# plus the bootloader stuff. rsync-preserve it all.
+rsync -aHAX --info=progress2 /run/live/medium/ "$LIVE_MNT/"
+
+# -------- copy NOMAD_DATA onto p3 --------
+echo ">>> Copying NOMAD_DATA from USB to $P3"
+DATA_MNT=$(mktemp -d)
+mount "$P3" "$DATA_MNT"
+# Copy everything EXCEPT docker's running state dirs — those get
+# recreated cleanly on the new system's first boot.
+rsync -aHAX --info=progress2 \
+    --exclude='docker/runtimes/*' \
+    --exclude='docker/tmp/*' \
+    /mnt/nomad-data/ "$DATA_MNT/"
+
+# -------- EFI / GRUB --------
+echo ">>> Installing GRUB"
+EFI_MNT=$(mktemp -d)
+mount "$P1" "$EFI_MNT"
+
+# Install the EFI GRUB. --removable makes the loader reside at
+# /EFI/BOOT/BOOTX64.EFI which most firmwares will boot without
+# needing an NVRAM entry — works on weirder hardware where
+# --target=x86_64-efi with a specific bootloader-id gets lost.
+grub-install \
+    --target=x86_64-efi \
+    --efi-directory="$EFI_MNT" \
+    --boot-directory="$LIVE_MNT/boot" \
+    --removable \
+    --recheck
+
+# Also install BIOS/MBR GRUB for machines that don't do EFI.
+grub-install \
+    --target=i386-pc \
+    --boot-directory="$LIVE_MNT/boot" \
+    --recheck \
+    "$TARGET"
+
+# Write a minimal grub.cfg pointing at our live boot.
+# Note: we keep it a live boot (toram) even on installed disk — the
+# whole architecture is RAM-backed, only NOMAD_DATA is read/written.
+mkdir -p "$LIVE_MNT/boot/grub"
+cat > "$LIVE_MNT/boot/grub/grub.cfg" <<EOF
+set timeout=5
+set default=0
+
+insmod ext2
+insmod part_gpt
+
+menuentry "Project Nomad" {
+    search --no-floppy --label NOMAD_LIVE --set=root
+    linux /live/vmlinuz boot=live components toram username=nomad hostname=nomad
+    initrd /live/initrd.img
+}
+
+menuentry "Project Nomad (safe graphics)" {
+    search --no-floppy --label NOMAD_LIVE --set=root
+    linux /live/vmlinuz boot=live components toram username=nomad hostname=nomad nomodeset
+    initrd /live/initrd.img
+}
+EOF
+
+# -------- cleanup --------
+echo ">>> Unmounting"
+sync
+umount "$EFI_MNT" "$LIVE_MNT" "$DATA_MNT"
+rmdir  "$EFI_MNT" "$LIVE_MNT" "$DATA_MNT"
+
+echo
+echo "=== Install complete ==="
+echo
+echo "Remove the USB and reboot. The machine should now boot Nomad"
+echo "from $TARGET directly."

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wrapper around `lb build`. Logs the full build to build.log for
+# debugging failures — live-build's output is too noisy to scroll.
+set -e
+lb build noauto "${@}" 2>&1 | tee build.log
