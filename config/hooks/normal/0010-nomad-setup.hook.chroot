@@ -19,7 +19,6 @@ chmod +x /usr/local/sbin/nomad-init
 chmod +x /usr/local/sbin/nomad-start
 chmod +x /usr/local/sbin/nomad-hotspot
 chmod +x /usr/local/sbin/nomad-install-to-disk
-chmod +x /usr/local/sbin/nomad-firstboot-ui
 chmod +x /usr/local/bin/nomad
 chmod +x /etc/profile.d/nomad-banner.sh
 
@@ -33,27 +32,24 @@ systemctl enable ssh
 systemctl enable docker
 systemctl enable connman
 
-# Nomad services. Two flows on first boot vs subsequent boots:
+# Nomad services. Boot flow:
 #
 #   FIRST BOOT (no /mnt/nomad-data/.nomad-initialized):
-#     multi-user.target → nomad-firstboot-ui takes tty1 (Conflicts
-#     getty@tty1 so login prompt won't appear), runs the verbose
-#     setup UI, on success touches the flag and reboots.
+#     nomad-mount → docker → nomad-init runs (loads images, ~20 min on USB)
+#     → ExecStartPost touches the flag → nomad-start brings up compose
 #
 #   SUBSEQUENT BOOTS (flag exists):
-#     ConditionPathExists fails on nomad-firstboot-ui → it exits
-#     immediately → getty@tty1 starts normally → MOTD on login.
+#     nomad-init's ConditionPathExists fails so it's skipped immediately
+#     → nomad-start brings up compose
 #
-# Both flows always run nomad-mount (mounts NOMAD_DATA) and
-# nomad-passwords (sets nomad/root passwords every boot since the
-# live overlay resets /etc/shadow).
+# nomad-passwords runs every boot (the live overlay resets /etc/shadow,
+# so we need to reset the password every boot too).
 echo ">>> enabling nomad services"
 systemctl enable nomad-passwords
 systemctl enable nomad-mount
 systemctl enable nomad-ssh-keys
 systemctl enable nomad-init
 systemctl enable nomad-start
-systemctl enable nomad-firstboot-ui
 
 # Hotspot tools are INSTALLED but NOT RUNNING by default. LAN is the
 # default posture; a future control script will flip these on.
@@ -62,16 +58,38 @@ systemctl disable hostapd 2>/dev/null || true
 systemctl disable dnsmasq 2>/dev/null || true
 
 # --- Network manager conflicts ---
-# Debian ships with TWO network managers that can conflict with ConnMan:
+# Debian ships with several network-related services that conflict with
+# ConnMan or block boot when offline:
 #   - systemd-networkd (probably inactive, but mask so nothing enables it)
+#   - systemd-networkd-wait-online (blocks boot waiting for an interface)
 #   - networking.service (legacy ifupdown, reads /etc/network/interfaces
 #     and requests its own DHCP lease, creating duplicate IPs on interfaces
 #     ConnMan is also managing)
-# Mask both.
-echo ">>> masking conflicting network managers (ConnMan is in charge)"
-systemctl mask systemd-networkd 2>/dev/null || true
-systemctl mask systemd-networkd-wait-online 2>/dev/null || true
-systemctl mask networking 2>/dev/null || true
+#   - connman-wait-online (blocks network-online.target until an
+#     interface is configured — boot hangs forever offline)
+#
+# We mask all four. Critically, we do NOT use `systemctl mask` here:
+# in a live-build chroot, systemctl is operating offline (no PID 1,
+# no D-Bus) and its behavior is finicky. Previous versions of this
+# hook used `systemctl mask ... 2>/dev/null || true` which silently
+# swallowed failures — and on the live system the mask was missing
+# and connman-wait-online still blocked boot.
+#
+# Writing the symlink directly is what `systemctl mask` is supposed
+# to do anyway: a symlink from /etc/systemd/system/<unit> to /dev/null
+# tells systemd "this unit is permanently disabled, even if something
+# Wants= or Requires= it". The systemd binary itself reads the symlink
+# at boot — no systemctl involvement needed.
+echo ">>> masking conflicting / blocking network units"
+for unit in \
+    systemd-networkd.service \
+    systemd-networkd-wait-online.service \
+    networking.service \
+    connman-wait-online.service \
+; do
+    ln -sf /dev/null "/etc/systemd/system/${unit}"
+    echo "  masked $unit"
+done
 
 # Keep systemd-resolved — it's the DNS resolver and ConnMan integrates
 # with it fine.

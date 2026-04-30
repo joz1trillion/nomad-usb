@@ -36,37 +36,22 @@ if TYPE_CHECKING:
 # Matches what live-build sets in auto/config (--bootappend-live):
 #   boot=live      tells live-boot to mount the squashfs
 #   components     enables live-config customizations
-#   quiet          suppress most boot-time kernel messages
-#   loglevel=3     only print warnings (3) and above to the console;
-#                  info/notice/debug go to the journal but not the
-#                  visible terminal. This stops docker's routine
-#                  "br-xxxx: port N entered forwarding state" spam
-#                  from scrolling the screen every time a container
-#                  starts or restarts.
-#   rd.systemd.show_status=auto
-#                  systemd in the initrd doesn't show each unit's
-#                  status line unless something fails
-#   systemd.show_status=auto
-#                  same, but for the main system (not just initrd)
-#   vt.global_cursor_default=0
-#                  hide the blinking underscore on idle TTYs between
-#                  the MOTD login prompt and the kernel messages
 #
-# NOTE: we deliberately do NOT pass `toram`. Earlier versions did,
-# which caused live-boot to rsync ~1GB of squashfs into RAM at every
-# boot. The rsync's `--info=progress2` output scrolled through
-# /dev/console = tty1, leaving the screen full of "boot/grub/...
-# 100%" lines after boot finished. Without toram, the squashfs is
-# mounted read-only directly from NOMAD_LIVE with a tmpfs overlay
-# for writes — slightly slower reads on rare uncached files, much
-# faster boot, ~1GB more free RAM for containers, and a clean tty1.
-# We're not optimizing for "yank the USB while running" anyway.
-GRUB_BOOTAPPEND = (
-    "boot=live components "
-    "quiet loglevel=3 "
-    "rd.systemd.show_status=auto systemd.show_status=auto "
-    "vt.global_cursor_default=0"
-)
+# We deliberately keep boot output VISIBLE (no quiet, no loglevel=3).
+# This is a server box that gets booted on unfamiliar hardware in
+# unknown network conditions. When something goes wrong — and it will —
+# the user needs to see what systemd is doing, what services are
+# failing, and what the kernel has to say about the disk and the
+# network. A pretty silent boot is worse than a noisy informative one.
+#
+# We also do NOT pass `toram`. live-boot's `toram` mode rsync's the
+# ~800MB squashfs into RAM at every boot, which (a) prints scrolling
+# rsync progress to /dev/console (looks like garbage), and (b) eats
+# 1GB of RAM that docker containers could be using. The squashfs
+# contains the base Debian system; docker reads from its own layers
+# in /mnt/nomad-data/docker/ which is a separate ext4 partition, so
+# the squashfs being on USB vs in RAM barely matters at runtime.
+GRUB_BOOTAPPEND = "boot=live components"
 
 
 def _grub_cfg(label_live: str = "NOMAD_LIVE") -> str:

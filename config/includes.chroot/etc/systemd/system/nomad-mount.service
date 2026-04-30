@@ -2,7 +2,7 @@
 Description=Mount NOMAD_DATA partition and set up data-partition state
 # Everything nomad-related depends on this. Docker's drop-in adds
 # Requires/After us, so we don't list docker here.
-Before=docker.service nomad-init.service nomad-start.service nomad-ssh-keys.service nomad-firstboot-ui.service
+Before=docker.service nomad-init.service nomad-start.service nomad-ssh-keys.service
 
 [Service]
 Type=oneshot
