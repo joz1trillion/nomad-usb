@@ -124,6 +124,7 @@ cat <<EOF
     nomad help                         # Full command reference
     nomad status                       # Current phase + containers
     nomad watch                        # Live-updating status view
+    nomad journal                      # Live systemd journal
     nomad motd                         # Re-show this banner
     nomad tips                         # Tips for common issues
     sudo nomad-hotspot on              # Start WiFi hotspot

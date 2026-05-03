@@ -50,6 +50,7 @@ systemctl enable nomad-mount
 systemctl enable nomad-ssh-keys
 systemctl enable nomad-init
 systemctl enable nomad-start
+systemctl enable nomad-quiet-console
 
 # Hotspot tools are INSTALLED but NOT RUNNING by default. LAN is the
 # default posture; a future control script will flip these on.

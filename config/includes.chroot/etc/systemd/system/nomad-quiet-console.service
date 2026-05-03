@@ -1,0 +1,36 @@
+[Unit]
+Description=Suppress kernel console messages after boot completes
+Documentation=man:dmesg(1)
+# Why this exists:
+# Docker creates and destroys virtual ethernet pairs (veth) every time
+# a container starts, stops, or has a healthcheck reconnect. The
+# kernel emits messages like:
+#   br-xxxxx: port N(vethYYYYY) entered blocking state
+#   br-xxxxx: port N(vethYYYYY) entered forwarding state
+# at level KERN_NOTICE (5). With the default console log level of 7
+# (KERN_DEBUG), all of those get printed to /dev/console, which is
+# tty1 — meaning every container restart paints garbage over whatever
+# the user was looking at on the screen.
+#
+# We solve this by lowering the console log level to 4 (KERN_WARN)
+# AFTER boot. Boot itself stays noisy (level 7) so the user can see
+# what's happening if anything fails. Once boot is complete, only
+# warnings, errors, and panics make it to the visible console.
+#
+# The messages still go to dmesg and the journal — we just stop
+# them from scribbling on the user's screen. `nomad journal --kernel`
+# brings them back if you actually need to see them.
+After=multi-user.target
+# Run very late so we don't accidentally hide useful boot messages.
+After=nomad-start.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# --console-level 4 = print KERN_WARN(4), KERN_ERR(3), KERN_CRIT(2),
+# KERN_ALERT(1), KERN_EMERG(0) only. Suppresses NOTICE(5), INFO(6),
+# DEBUG(7).
+ExecStart=/usr/bin/dmesg --console-level 4
+
+[Install]
+WantedBy=multi-user.target

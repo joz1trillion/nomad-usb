@@ -95,7 +95,8 @@ Usage:
   nomad start               Start all Nomad services
   nomad stop                Stop all Nomad services
   nomad restart             Restart all services (stop then start)
-  nomad logs [SERVICE]      Tail logs (all services, or one named)
+  nomad logs [SERVICE]      Live container logs (mysql, admin, etc.)
+  nomad journal [--kernel]  Live systemd journal (nomad-init, docker, etc.)
   nomad tips                Show useful tips for common issues
   nomad pull                Pull latest container images (requires internet)
   nomad ps                  Alias for 'status'
@@ -552,6 +553,73 @@ EOF
         dc down
         dc up -d --remove-orphans
         ;;
+    journal)
+        # Live-follow the systemd journal for nomad-related services.
+        # Shows nomad-init, nomad-start, nomad-mount, nomad-passwords,
+        # nomad-ssh-keys, plus docker and containerd. This is the
+        # right command when something seems stuck or broken at the
+        # service level — you see what systemd is doing in real time.
+        #
+        # Two optional flags:
+        #   --kernel    also include kernel messages (veth/bridge spam,
+        #               but useful when networking is broken)
+        #   --since X   start from X ago instead of "now" (e.g. --since 10m)
+        #
+        # For container logs (what's printed by mysql, admin, etc.
+        # inside their containers), use `nomad logs` instead — that's
+        # a different thing.
+        units=(
+            -u nomad-init.service
+            -u nomad-start.service
+            -u nomad-mount.service
+            -u nomad-passwords.service
+            -u nomad-ssh-keys.service
+            -u docker.service
+            -u containerd.service
+        )
+        include_kernel=0
+        since_arg=()
+
+        # Argument parser: we accept --kernel and --since=X (or --since X).
+        # Anything else gets passed through to journalctl raw, so power
+        # users can do e.g. `nomad journal --no-pager -n 100`.
+        passthrough=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --kernel|-k)
+                    include_kernel=1
+                    shift
+                    ;;
+                --since)
+                    since_arg=(--since "$2")
+                    shift 2
+                    ;;
+                --since=*)
+                    since_arg=(--since "${1#--since=}")
+                    shift
+                    ;;
+                *)
+                    passthrough+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+
+        # -k adds the kernel ring buffer (--dmesg). We default OFF
+        # because the docker veth bridge messages flood the output
+        # and bury the interesting service-level stuff.
+        kernel_arg=()
+        [ "$include_kernel" = "1" ] && kernel_arg=(-k)
+
+        # -f follows; --no-hostname strips "nomad" from each line for
+        # readability since we know we're on this host.
+        exec journalctl -f --no-hostname \
+            "${units[@]}" \
+            "${kernel_arg[@]}" \
+            "${since_arg[@]}" \
+            "${passthrough[@]}"
+        ;;
+
     logs)
         cd_nomad
         # Pass through remaining args so `nomad logs -f admin` works.
