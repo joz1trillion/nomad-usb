@@ -1,14 +1,27 @@
 #!/bin/bash
 #
 # nomad-init: runs exactly once per USB, on first boot.
-# Loads docker-image tarballs the flash tool placed in
-# /mnt/nomad-data/images/ so containers are ready offline.
+#
+# Two modes:
+#
+# 1. PREBUILT MODE
+#    The flash tool extracted a pre-populated /var/lib/docker tree
+#    onto NOMAD_DATA at flash time, and dropped a marker file at
+#    /mnt/nomad-data/docker/.nomad-prebuilt. Nothing for us to do —
+#    docker will see the tree and serve images immediately. We just
+#    log that we're skipping and exit.
+#
+# 2. TARBALL MODE (legacy / fallback)
+#    The flash tool placed *.tar files in /mnt/nomad-data/images/.
+#    We `docker load` them all, which on a USB takes 15-30 minutes.
+#    We track per-image progress and write it to /run/nomad-init.state
+#    so `nomad watch` can render a live view.
 #
 # This script is intentionally SILENT to /dev/tty1. Loading 5GB+ of
-# images takes 15-20 minutes on USB and we used to splat that progress
-# all over the screen, which was annoying after Nomad came up because
-# every container start also printed kernel messages over whatever you
-# were looking at. Now: progress goes to two places only:
+# images takes a long time and used to splat progress all over the
+# screen, which was annoying after Nomad came up because every
+# container start would also paint kernel messages over whatever
+# you were looking at. Now: progress goes to two places only:
 #
 #   - the systemd journal (boring, queryable later)
 #   - /run/nomad-init.state (a structured file `nomad watch` reads)
@@ -18,13 +31,15 @@
 set -uo pipefail
 
 IMAGES_DIR="/mnt/nomad-data/images"
+DOCKER_DIR="/mnt/nomad-data/docker"
+PREBUILT_MARKER="/mnt/nomad-data/docker/.nomad-prebuilt"
+
 STATUS_FILE="/run/nomad-status"      # one-line summary, legacy
 STATE_FILE="/run/nomad-init.state"   # structured key=value, parseable
 PV_BYTES_FILE="/run/nomad-init.pv"   # current bytes-through-pipe
 LOG_FILE="/run/nomad-init.log"       # docker load output for debugging
 
 # Write a status line to journal + the legacy STATUS_FILE.
-# No tty1 anymore — `nomad watch` is the way to follow progress.
 say() {
     local msg="$1"
     echo "[nomad-init] $msg"
@@ -36,11 +51,9 @@ say() {
 # the same key, append the new line, atomic-rename. Cheap on tmpfs.
 #
 # We chmod 644 after the rename: mktemp creates files mode 600, and
-# `mv` preserves the source permissions. Without this, `nomad watch`
-# running as the (unprivileged) nomad user can't read state and
-# silently falls back to the empty view — the symptom is `nomad watch`
-# showing zero images and the "post-init" docker ps table even while
-# init is still running.
+# `mv` preserves source permissions. Without this, `nomad watch`
+# (running as the unprivileged nomad user) can't read state and
+# silently falls back to the empty view.
 set_state() {
     local key="$1" val="$2"
     local tmp
@@ -53,9 +66,8 @@ set_state() {
     chmod 644 "$STATE_FILE" 2>/dev/null || true
 }
 
-# Initial state. Everything cleared so a previous run's state can't
-# bleed into this one (matters during dev when we're testing).
-# Set 644 perms here too so the empty-init versions are also readable.
+# Initial state. Cleared so a previous run's state can't bleed into
+# this one (matters during dev when we're testing).
 mkdir -p "$(dirname "$STATE_FILE")"
 : > "$STATE_FILE"
 : > "$PV_BYTES_FILE"
@@ -63,7 +75,25 @@ mkdir -p "$(dirname "$STATE_FILE")"
 chmod 644 "$STATE_FILE" "$PV_BYTES_FILE" "$LOG_FILE" 2>/dev/null || true
 set_state phase init
 
-# ---- early-exit cases ----
+# ---- MODE DETECTION ----
+# Prebuilt mode: the flash tool dropped a marker. Check this BEFORE
+# the tarball-mode early-exits, since on a prebuilt-flashed USB there
+# is no images/ directory at all and we'd otherwise log a misleading
+# "skipping, no images" message.
+if [ -f "$PREBUILT_MARKER" ]; then
+    say "prebuilt docker tree detected — no image loading needed"
+    set_state phase done
+    set_state mode prebuilt
+    set_state expected_images 0
+    set_state loaded_count 0
+    exit 0
+fi
+
+# ---- TARBALL MODE ----
+set_state mode tarball
+
+# Early-exit: no images directory at all means the flash didn't write
+# images either (e.g. the user used a custom flow). Successful no-op.
 if [ ! -d "$IMAGES_DIR" ]; then
     say "no images directory at $IMAGES_DIR, skipping"
     set_state phase skipped
@@ -83,8 +113,7 @@ fi
 # docker save tarballs have a manifest.json at the top level. Each
 # entry's RepoTags array tells us the friendly image name. We
 # pre-extract these so `nomad watch` can show the full image list
-# with pending/active/done state for each, even before docker load
-# has touched any of them.
+# with pending/active/done state for each.
 total_bytes=0
 all_images=()
 for tar in "${tars[@]}"; do
@@ -92,9 +121,6 @@ for tar in "${tars[@]}"; do
     total_bytes=$((total_bytes + sz))
 
     if command -v jq >/dev/null 2>&1; then
-        # Pull the first RepoTag from each manifest entry. Some entries
-        # have multiple tags (same image, multiple names) — we just
-        # take the first to keep the display clean.
         while IFS= read -r tag; do
             [ -n "$tag" ] && all_images+=("$tag")
         done < <(tar -xOf "$tar" manifest.json 2>/dev/null \
@@ -107,14 +133,13 @@ total_mb=$((total_bytes / 1024 / 1024))
 
 set_state total_bytes "$total_bytes"
 set_state expected_images "$expected_images"
-# images=name1,name2,name3 — comma-separated single line for easy parsing
 IFS=','; set_state images "${all_images[*]}"; IFS=$' \t\n'
 
 say "loading ${#tars[@]} tarball(s), ${total_mb} MB total, $expected_images image(s)"
 
 # ---- the load loop ----
 idx=0
-loaded_total=0      # cumulative across all tarballs
+loaded_total=0
 load_start_ts=$(date +%s)
 set_state load_start_ts "$load_start_ts"
 
@@ -127,15 +152,8 @@ for tar in "${tars[@]}"; do
     set_state current_tarball "$idx"
     set_state current_tarball_size "$sz"
 
-    # Reset pv bytes file for this tarball — pv writes one line of
-    # numbers (current bytes processed) once a second. nomad watch
-    # tail-reads this for the phase-1 progress bar.
     : > "$PV_BYTES_FILE"
 
-    # ---- run pv | docker load in background ----
-    # pv -n -b prints raw bytes-so-far number, one per second, to
-    # stderr. We redirect that to PV_BYTES_FILE. nomad watch reads
-    # the last line of that file to draw a real-time progress bar.
     if command -v pv >/dev/null 2>&1; then
         ( pv -n -b -i 1 -s "$sz" "$tar" 2>"$PV_BYTES_FILE" \
           | docker load >> "$LOG_FILE" 2>&1 ) &
@@ -144,40 +162,20 @@ for tar in "${tars[@]}"; do
     fi
     LOAD_PID=$!
 
-    # ---- poll loop: track per-image unpack progress ----
-    # docker load prints "Loaded image: <name>" to stdout each time
-    # it finishes unpacking one. We tail $LOG_FILE looking for those
-    # and update STATE_FILE so watch can render the per-image list.
-    #
-    # HANG WORKAROUND: docker load sometimes hangs at the END of a
-    # large tarball — all images are loaded and visible in `docker
-    # images`, but the docker load process itself never exits.
-    # Observed on Trixie's docker.io with our ~5GB tarball; appears
-    # to be a daemon-side issue with finalization.
-    #
-    # Without this workaround, init blocks forever; nomad-start
-    # never runs; the user sees "loading tarball" until they reboot.
-    #
-    # Workaround: once all expected images are loaded AND docker load
-    # has been idle (no new "Loaded image:" lines) for HANG_TIMEOUT
-    # seconds, declare victory and SIGTERM the process. The work IS
-    # done — `docker images` shows everything — we're just unwedging
-    # a stuck flush.
+    # Hang detection: if all expected images are loaded but the
+    # docker load process hasn't exited within HANG_TIMEOUT seconds,
+    # SIGTERM it. Observed on Trixie: docker load sometimes hangs
+    # at the end despite all images being unpacked successfully.
     HANG_TIMEOUT=90
     last_count=0
     last_progress_ts=$(date +%s)
 
     while kill -0 "$LOAD_PID" 2>/dev/null; do
-        # Count finished images in the log so far.
         loaded=$(grep -c '^Loaded image' "$LOG_FILE" 2>/dev/null || echo 0)
         loaded=${loaded//[^0-9]/}
         loaded=${loaded:-0}
 
         if [ "$loaded" != "$last_count" ]; then
-            # Pull the loaded names. Format: "Loaded image: name:tag" or
-            # "Loaded image ID: sha256:..." — we want the names. The
-            # ID-form happens for layers without tags, which is normal
-            # for docker save'd images and we just skip those.
             done_names=$(grep '^Loaded image:' "$LOG_FILE" 2>/dev/null \
                          | sed 's/^Loaded image: //' \
                          | tr '\n' ',' | sed 's/,$//')
@@ -198,19 +196,13 @@ for tar in "${tars[@]}"; do
             last_count=$loaded
             last_progress_ts=$(date +%s)
         else
-            # No new images this tick. Check for the hang condition:
-            # all expected images loaded AND no progress for a while.
             if [ "$expected_images" -gt 0 ] && [ "$loaded" -ge "$expected_images" ]; then
                 idle=$(( $(date +%s) - last_progress_ts ))
                 if [ "$idle" -ge "$HANG_TIMEOUT" ]; then
                     say "all $expected_images images loaded; docker load idle ${idle}s, unwedging"
-                    # SIGTERM first; if it doesn't die quickly, SIGKILL.
                     kill -TERM "$LOAD_PID" 2>/dev/null || true
                     sleep 2
                     kill -KILL "$LOAD_PID" 2>/dev/null || true
-                    # The wait below will return non-zero (signal exit
-                    # codes are 128 + signum). We treat that as success
-                    # because we know the work completed — see below.
                     break
                 fi
             fi
@@ -219,16 +211,9 @@ for tar in "${tars[@]}"; do
         sleep 1
     done
 
-    # Capture exit code. If we killed the process due to a hang after
-    # all images loaded, the exit code will be non-zero (probably 143
-    # for SIGTERM or 137 for SIGKILL). That's fine — the load
-    # actually succeeded, we just had to evict a stuck process.
     wait "$LOAD_PID" 2>/dev/null
     load_rc=$?
 
-    # Verify by counting again: if expected_images are present in the
-    # log, we're good regardless of how docker load exited. Only treat
-    # as a real failure if the image count is short.
     final=$(grep -c '^Loaded image' "$LOG_FILE" 2>/dev/null || echo 0)
     final=${final//[^0-9]/}
     final=${final:-0}
@@ -239,10 +224,7 @@ for tar in "${tars[@]}"; do
         exit 1
     fi
 
-    # Track cumulative image count across multiple tarballs (in case
-    # we ever ship multiple tar files instead of one big nomad.tar).
     loaded_total=$final
-
     say "tarball ${idx}/${#tars[@]} done ($final images)"
 done
 

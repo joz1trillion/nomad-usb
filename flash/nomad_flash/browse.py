@@ -1,168 +1,117 @@
-"""File-picking helpers for the wizard.
+"""Filesystem browser for the file picker in advanced options.
 
-Two strategies, in order of preference:
+The flash tool's wizard has two advanced fields where users can point
+at a local file instead of downloading:
+  - Local ISO override
+  - Local docker tarball override
 
-1. Native dialog via `zenity --file-selection`. Real path, real
-   experience, only works if zenity is installed and a desktop
-   session is available.
+Rather than making them type a path, we expose a simple filesystem
+browser via /api/picker/browse. The frontend renders this as a modal
+that lets them navigate folders and pick a file.
 
-2. Built-in directory browser. Talks to the backend to list a
-   directory, user clicks through. Works anywhere, no GUI deps.
+We don't use zenity (the GTK file dialog) anymore. Earlier versions
+did, but it was finicky on different desktops, hard to position
+correctly relative to the browser, and required a desktop session.
+The in-app browser works the same in any browser, on any host
+(including headless ones via SSH tunnel).
 
-The frontend probes /api/picker/zenity-available at load time and
-shows the appropriate UI affordance — a "Browse" button if zenity
-is available, otherwise the in-app browser as the only option.
+Filtering: we list directories always, and files matching the caller-
+provided extension hint. If the caller doesn't pass one, all files
+show but only files with allowed extensions are selectable.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-from dataclasses import dataclass, asdict
 from pathlib import Path
 
 
-# --------------------------------------------------------------------
-# Zenity (option 2) — native file picker
-# --------------------------------------------------------------------
+# Default starting directory if none provided. Most users keep
+# downloads here. Falling back to home if Downloads doesn't exist
+# is fine — they can navigate from there.
+def _default_start_dir() -> Path:
+    home = Path.home()
+    candidates = [home / "Downloads", home]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return Path("/")
 
-def zenity_available() -> bool:
-    """True if we can pop a native file dialog.
 
-    Two checks: zenity is on PATH, and there's a display server we
-    can attach to. Without DISPLAY (or WAYLAND_DISPLAY) zenity will
-    silently exit non-zero — better to know up front.
+def list_directory_dict(path: str | None,
+                        allowed_exts: list[str] | None = None) -> dict:
+    """List a directory's contents for the in-app file browser.
+
+    Returns a dict with:
+      cwd:     resolved absolute path
+      parent:  the parent dir's path, or None if we're at /
+      entries: list of {name, path, is_dir, is_match, size}
+
+    `allowed_exts` is a list like ['.iso'] or ['.gz', '.xz', '.tar'].
+    Entries matching one of these are flagged with is_match=True so
+    the frontend can style them as selectable. is_dir entries are
+    always navigable regardless of allowed_exts.
+
+    Hidden entries (.foo) and broken symlinks are skipped.
     """
-    if shutil.which("zenity") is None:
-        return False
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return False
-    return True
+    target = Path(path).expanduser().resolve() if path else _default_start_dir()
 
-
-def pick_iso_with_zenity(start_dir: str | None = None) -> str | None:
-    """Pop a native file picker, return chosen path or None if cancelled.
-
-    `start_dir` sets where the dialog opens — defaults to ~/Downloads,
-    falling back to $HOME if that doesn't exist.
-    """
-    if start_dir is None:
-        downloads = Path.home() / "Downloads"
-        start_dir = str(downloads if downloads.is_dir() else Path.home())
-
-    # zenity wants a trailing slash on the start dir to mean "open
-    # this directory" rather than "select this filename".
-    if not start_dir.endswith("/"):
-        start_dir += "/"
-
-    cmd = [
-        "zenity", "--file-selection",
-        "--title=Select Nomad ISO",
-        f"--filename={start_dir}",
-        "--file-filter=ISO files | *.iso",
-        "--file-filter=All files | *",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        # User left the dialog open for 5 minutes — treat as cancel.
-        return None
-    except FileNotFoundError:
-        return None
-
-    # zenity exit codes: 0 = file picked, 1 = cancelled, 5 = timeout
-    if result.returncode != 0:
-        return None
-
-    path = result.stdout.strip()
-    return path or None
-
-
-# --------------------------------------------------------------------
-# Built-in browser (option 3) — directory listing API
-# --------------------------------------------------------------------
-
-@dataclass
-class BrowseEntry:
-    name: str       # display name (just basename)
-    path: str       # absolute path
-    is_dir: bool    # for icon and click behavior on the frontend
-    size: int = 0   # bytes; 0 for directories
-    is_iso: bool = False  # true if file ends in .iso (case-insensitive)
-
-
-@dataclass
-class BrowseResult:
-    cwd: str                  # the directory we listed
-    parent: str | None        # absolute path of the parent, or None at /
-    entries: list[BrowseEntry]
-
-
-def list_directory(path: str | None = None,
-                   show_hidden: bool = False) -> BrowseResult:
-    """List a directory for the in-app browser.
-
-    Defaults to ~/Downloads. Falls back to $HOME if Downloads doesn't
-    exist. Always returns absolute, resolved paths so the frontend
-    doesn't have to do path arithmetic.
-
-    Filtering behavior:
-      - Directories are always shown (so users can navigate into them)
-      - Files are shown but only `.iso` files are flagged with is_iso
-      - Hidden items (leading dot) are skipped unless show_hidden=True
-    """
-    if path is None:
-        downloads = Path.home() / "Downloads"
-        path = str(downloads if downloads.is_dir() else Path.home())
-
-    target = Path(path).expanduser().resolve()
-
-    # If the user passed a non-existent or non-directory path, fall
-    # back to home rather than 500ing the API. Friendlier UX — the
-    # in-app browser just opens at home and the user can navigate.
+    # Don't let callers escape into anything ridiculous via .. or
+    # symlinks — but we DO let them navigate to absolute paths since
+    # that's the whole point of the picker. The 'safety' here is
+    # purely about not crashing on weird paths.
     if not target.is_dir():
-        target = Path.home().resolve()
+        # Fall back to default rather than error — gentler UX when
+        # state from a previous session points at a deleted folder.
+        target = _default_start_dir()
 
-    entries: list[BrowseEntry] = []
+    entries = []
     try:
         for child in sorted(target.iterdir(),
                             key=lambda p: (not p.is_dir(), p.name.lower())):
-            if not show_hidden and child.name.startswith("."):
+            # Skip hidden files. They're rarely what the user wants
+            # and they clutter the list with .git, .cache, etc.
+            if child.name.startswith("."):
                 continue
+
             try:
+                # is_dir() raises on broken symlinks; treat those as
+                # files so they at least show up but aren't clickable.
                 is_dir = child.is_dir()
                 size = 0 if is_dir else child.stat().st_size
-            except OSError:
-                # Permission denied / broken symlink / race — skip silently.
+            except (OSError, PermissionError):
                 continue
-            entries.append(BrowseEntry(
-                name=child.name,
-                path=str(child),
-                is_dir=is_dir,
-                size=size,
-                is_iso=(not is_dir and child.suffix.lower() == ".iso"),
-            ))
+
+            # Match check: any allowed extension matches the suffix(es)?
+            is_match = False
+            if allowed_exts:
+                # Multi-suffix files like "foo.tar.xz" — match against
+                # the joined trailing suffixes too.
+                suffixes = "".join(child.suffixes).lower()
+                last = child.suffix.lower()
+                for ext in allowed_exts:
+                    e = ext.lower()
+                    if e == last or suffixes.endswith(e):
+                        is_match = True
+                        break
+
+            entries.append({
+                "name": child.name,
+                "path": str(child),
+                "is_dir": is_dir,
+                "is_match": is_match,
+                "size": size,
+            })
     except PermissionError:
-        # Can't read the directory at all — return an empty list with
-        # the cwd set so the UI shows where it tried to go.
-        pass
+        # Can't list this dir — return empty entries with a message
+        # the frontend can render. We still set cwd/parent so the
+        # back navigation works.
+        entries = []
 
-    parent = None
-    if target.parent != target:  # not at the filesystem root
-        parent = str(target.parent)
+    parent = str(target.parent) if target.parent != target else None
 
-    return BrowseResult(cwd=str(target), parent=parent, entries=entries)
-
-
-def list_directory_dict(path: str | None = None) -> dict:
-    """JSON-serializable wrapper around list_directory()."""
-    result = list_directory(path)
     return {
-        "cwd": result.cwd,
-        "parent": result.parent,
-        "entries": [asdict(e) for e in result.entries],
+        "cwd": str(target),
+        "parent": parent,
+        "entries": entries,
     }

@@ -1,5 +1,5 @@
 /*
- * nomad-flash — wizard styles.
+ * nomad-flash — wizard styles (v0.6.1).
  *
  * Aim: clean, dark, no-nonsense. The user is about to wipe a USB
  * drive — the UI should feel deliberate and serious, not flashy.
@@ -45,7 +45,16 @@ html, body {
     padding: 4rem 0;
 }
 
+code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85em;
+    background: var(--bg-elev);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+}
+
 /* ---------- header ---------- */
+
 .header {
     display: flex;
     align-items: baseline;
@@ -63,6 +72,7 @@ html, body {
 }
 
 /* ---------- step indicator ---------- */
+
 .steps {
     display: flex;
     gap: 0.25rem;
@@ -79,6 +89,7 @@ html, body {
 .steps .step.current { background: var(--text); }
 
 /* ---------- card ---------- */
+
 .card {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -97,12 +108,14 @@ html, body {
 }
 
 /* ---------- form elements ---------- */
+
 label {
     display: block;
     margin-bottom: 0.35rem;
     font-size: 0.9rem;
     color: var(--text-dim);
 }
+
 input[type="text"], select {
     width: 100%;
     padding: 0.5rem 0.75rem;
@@ -111,13 +124,35 @@ input[type="text"], select {
     border: 1px solid var(--border);
     border-radius: 6px;
     font-size: 0.95rem;
+    line-height: 1.4;
 }
 input[type="text"]:focus, select:focus {
     outline: none;
     border-color: var(--accent);
 }
 
+.hint {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    margin-top: 0.35rem;
+}
+
+/* Inputs with a "Browse…" button attached on the right. The button
+   sits flush against the input so they feel like one unit. */
+.input-with-button {
+    display: flex;
+    gap: 0.5rem;
+}
+.input-with-button input[type="text"] {
+    flex: 1;
+}
+.input-with-button button {
+    padding: 0.5rem 1rem;
+    white-space: nowrap;
+}
+
 /* ---------- buttons ---------- */
+
 .actions {
     display: flex;
     justify-content: space-between;
@@ -162,121 +197,73 @@ button.danger:hover:not(:disabled) {
     background: #c93e34;
 }
 
-/* ---------- split button (action + dropdown arrow) ---------- */
-.split-btn {
-    position: relative;
-    display: inline-flex;
+/* ---------- advanced collapsible ---------- */
+
+.advanced {
+    margin-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
 }
-.split-btn-main {
-    /* Right-attached: square the right side so it meets the arrow flush */
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-    border-right: none;
+.advanced summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    user-select: none;
+    list-style: none;
 }
-.split-btn-arrow {
-    /* Left-attached: square the left side, narrower than a normal button */
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    padding: 0.6rem 0.5rem;
-    font-size: 0.75rem;
+.advanced summary::-webkit-details-marker { display: none; }
+.advanced summary::before {
+    content: '▸ ';
+    display: inline-block;
+    transition: transform 0.15s;
 }
-.split-btn-menu {
-    /* Hidden by default — shown when the .split-btn parent gets .open */
-    display: none;
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    min-width: 100%;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.25rem;
-    z-index: 50;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    flex-direction: column;
-    gap: 0.15rem;
-    /* whitespace: nowrap stops the menu items from wrapping awkwardly */
-    white-space: nowrap;
+.advanced[open] summary::before {
+    transform: rotate(90deg);
 }
-.split-btn.open .split-btn-menu {
-    display: flex;
+.advanced summary:hover { color: var(--text); }
+
+.advanced-body {
+    padding-top: 1rem;
 }
 
-/* ---------- optional apps checkbox list ---------- */
-.apps-toolbar {
+.adv-section {
+    margin-bottom: 1.25rem;
+}
+.adv-section:last-child { margin-bottom: 0; }
+
+/* ---------- cache list (in advanced) ---------- */
+
+.cache-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+.cache-row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
-    font-size: 0.85rem;
-}
-.apps-toolbar .link-btn {
-    background: none;
-    border: none;
-    padding: 0;
-    margin: 0;
-    color: var(--accent);
-    cursor: pointer;
-    font: inherit;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-}
-.apps-toolbar .link-btn:hover {
-    color: var(--text);
-}
-.apps-toolbar .toolbar-sep {
-    color: var(--text-dim);
-}
-
-.app-row {
-    display: flex;
     gap: 0.75rem;
-    padding: 0.75rem 1rem;
+    padding: 0.4rem 0.6rem;
     background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 0.5rem;
-    cursor: pointer;
-    transition: border-color 0.15s;
-}
-.app-row:hover { border-color: var(--text-dim); }
-.app-row input[type="checkbox"] {
-    /* Make the box a sensible size; the default browser one is tiny */
-    width: 1.1rem;
-    height: 1.1rem;
-    margin-top: 0.2rem;
-    cursor: pointer;
-    accent-color: var(--accent);
-}
-.app-meta { flex: 1; }
-.app-name {
-    font-weight: 600;
-    display: flex;
-    align-items: baseline;
-    gap: 0.5rem;
-}
-.app-size {
-    font-weight: 400;
-    font-size: 0.8rem;
-    color: var(--text-dim);
-}
-.app-desc {
-    color: var(--text-dim);
+    border-radius: 5px;
     font-size: 0.85rem;
-    margin-top: 0.25rem;
 }
-.split-btn-menu button {
-    width: 100%;
-    text-align: left;
-    border: 1px solid transparent;
-    background: transparent;
+.cache-tag {
+    font-family: ui-monospace, monospace;
+    font-weight: 600;
+    min-width: 5rem;
 }
-.split-btn-menu button:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--border);
+.cache-size {
+    color: var(--text-dim);
+    flex: 1;
+}
+.clear-cache-btn {
+    padding: 0.25rem 0.6rem;
+    font-size: 0.8rem;
 }
 
 /* ---------- device list ---------- */
+
 .device-list {
     display: flex;
     flex-direction: column;
@@ -306,7 +293,111 @@ button.danger:hover:not(:disabled) {
 }
 .device .removable.yes { color: var(--accent); }
 
-/* ---------- progress ---------- */
+/* ---------- mode selection cards ---------- */
+
+.mode-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1rem 0 0;
+}
+.mode-card {
+    padding: 1rem;
+    background: var(--bg-elev);
+    border: 2px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: border-color 0.15s;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+.mode-card:hover { border-color: var(--text-dim); }
+.mode-card.selected {
+    border-color: var(--accent);
+    background: rgba(0, 255, 136, 0.04);
+}
+.mode-card-title {
+    font-weight: 600;
+    font-size: 1rem;
+}
+.mode-card-tag {
+    color: var(--accent);
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.mode-card-desc {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    line-height: 1.45;
+    margin-top: 0.25rem;
+}
+
+@media (max-width: 540px) {
+    .mode-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------- progress bar (visual, in-UI) ---------- */
+/*
+ * The big in-UI progress bar that replaced the wall-of-terminal-text
+ * from v0.6.0. Sits above the (collapsed) logs panel and tracks
+ * completion across the whole flash, not just the current step.
+ */
+
+.overall-progress {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 1rem 0 1.25rem;
+}
+.overall-progress-bar {
+    flex: 1;
+    height: 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.overall-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    /* Slight inertia so the bar glides instead of jumping per chunk */
+    transition: width 0.25s ease-out;
+}
+.overall-progress-text {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    min-width: 3.5rem;
+    text-align: right;
+}
+
+/* ---------- collapsed logs panel ---------- */
+
+#log-details {
+    margin-top: 0.5rem;
+}
+#log-details summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    padding: 0.25rem 0;
+    user-select: none;
+    list-style: none;
+}
+#log-details summary::-webkit-details-marker { display: none; }
+#log-details summary::before {
+    content: '▸ ';
+    display: inline-block;
+    transition: transform 0.15s;
+}
+#log-details[open] summary::before {
+    transform: rotate(90deg);
+}
+#log-details summary:hover { color: var(--text); }
+
 .log {
     background: #000;
     color: #b9c0c8;
@@ -317,9 +408,11 @@ button.danger:hover:not(:disabled) {
     height: 280px;
     overflow-y: auto;
     white-space: pre-wrap;
+    margin-top: 0.5rem;
 }
 
 /* ---------- alert / notice ---------- */
+
 .alert {
     padding: 0.75rem 1rem;
     border-radius: 6px;
@@ -328,3 +421,110 @@ button.danger:hover:not(:disabled) {
 }
 .alert.warn   { border-color: var(--warn);   background: rgba(255,166,87,0.08);  color: var(--warn); }
 .alert.danger { border-color: var(--danger); background: rgba(248,81,73,0.08);   color: var(--danger); }
+
+/* ---------- modal (file picker) ---------- */
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Some breathing room on small screens so the modal isn't flush
+       against the viewport edge */
+    padding: 1rem;
+}
+.modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    width: min(640px, 100%);
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    /* Subtle drop shadow so it lifts off the dimmed background */
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    /* Override the .card h2 default margins so spacing inside the
+       modal header feels right */
+    margin: 0;
+}
+.modal-header h2 {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+.modal-close {
+    padding: 0.25rem 0.6rem;
+    font-size: 0.9rem;
+}
+
+/* ---------- file browser entries (inside modal) ---------- */
+
+.fb-cwd {
+    font-family: ui-monospace, monospace;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    word-break: break-all;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+}
+.fb-list {
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.4rem;
+}
+.fb-entry {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.5rem;
+    border-radius: 4px;
+    transition: background 0.1s;
+    /* Long filenames shouldn't push the size column off screen */
+    min-width: 0;
+}
+.fb-dir,
+.fb-match {
+    cursor: pointer;
+}
+.fb-other {
+    /* Non-matching files: visible but dimmed and unclickable */
+    opacity: 0.4;
+    cursor: default;
+}
+.fb-dir:hover,
+.fb-match:hover {
+    background: var(--bg-elev);
+}
+.fb-icon {
+    flex: 0 0 auto;
+}
+.fb-name {
+    flex: 1;
+    /* Truncate long names with ellipsis instead of wrapping */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+.fb-size {
+    flex: 0 0 auto;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    font-family: ui-monospace, monospace;
+}

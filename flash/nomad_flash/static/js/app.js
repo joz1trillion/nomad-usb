@@ -1,38 +1,17 @@
-// nomad-flash — wizard SPA.
-//
-// Deliberately framework-free: this is a five-step wizard, not a
-// SaaS product. Vanilla JS keeps the install lightweight (no node,
-// no build step) and the source easy to follow.
-//
-// State machine:
-//
-//   welcome → select-iso → select-device → select-apps → confirm → progress → done
-//
-// Each step is a render function. They share a single `state` object.
-// Navigating calls render(stepName) which clears the root and rebuilds.
+// nomad-flash — wizard SPA (v0.6.1).
 
 const root = document.getElementById('app');
 
-const STEPS = [
-    'welcome',
-    'select-iso',
-    'select-device',
-    'select-apps',
-    'confirm',
-    'progress',
-    'done',
-];
+const STEPS = ['welcome', 'device', 'mode', 'confirm', 'progress', 'done'];
 
 const state = {
     current: 'welcome',
-    iso: null,            // path string
-    device: null,         // {name, size, model, ...}
-    apps: new Set(),      // selected optional app keys
-    fromArchive: null,    // optional pre-built tarball path
-    // Backend version, populated from /api/health on startup. Shown
-    // in the page header so we (and the user) can tell at a glance
-    // whether the latest build is actually loaded — handy after deploys.
-    version: 'loading…',
+    device: null,
+    flashMode: 'full',
+    version: null,
+    isoPathOverride: '',
+    dockerTarOverride: '',
+    version_label: 'loading…',
 };
 
 // ---------- API helpers ----------
@@ -49,7 +28,7 @@ function header() {
     return `
         <div class="header">
             <h1>Nomad Flash</h1>
-            <span class="version">v${state.version}</span>
+            <span class="version">v${state.version_label}</span>
         </div>
         <div class="steps">
             ${STEPS.filter(s => s !== 'done').map(name => {
@@ -64,12 +43,125 @@ function header() {
     `;
 }
 
-// ---------- steps ----------
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
-function renderWelcome() {
-    // Reflect root state captured during bootstrap. If we don't have
-    // root, the flash will fail at the partition step — warn early
-    // rather than letting them go through the whole wizard first.
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+    return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+// ---------- in-app file browser (used in advanced overrides) ----------
+//
+// Mounts a modal over the wizard. The user navigates the filesystem
+// and clicks a file matching `allowedExts` to select it. Selection
+// fires `onSelect(path)` and closes the modal.
+
+function openFileBrowser(opts) {
+    const allowedExts = opts.allowedExts || [];   // e.g. ['.iso']
+    const onSelect = opts.onSelect || (() => {});
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const close = () => overlay.remove();
+
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) close();
+    });
+
+    async function loadDir(path) {
+        try {
+            const params = new URLSearchParams();
+            if (path) params.set('path', path);
+            if (allowedExts.length) params.set('exts', allowedExts.join(','));
+            const data = await api(`/picker/browse?${params}`);
+            render(data);
+        } catch (e) {
+            modal.innerHTML = `
+                <div class="modal-header">
+                    <h2>Browse files</h2>
+                    <button class="modal-close">✕</button>
+                </div>
+                <p style="color: var(--danger);">Browse failed: ${escapeHtml(e.message)}</p>
+            `;
+            modal.querySelector('.modal-close').onclick = close;
+        }
+    }
+
+    function render(data) {
+        const items = data.entries.map(e => {
+            // Style by what they are. Directories: navigable (always).
+            // Matching files: selectable. Other files: dim, non-clickable.
+            const icon = e.is_dir ? '📁' : (e.is_match ? '💿' : '📄');
+            const cls = e.is_dir
+                ? 'fb-entry fb-dir'
+                : (e.is_match ? 'fb-entry fb-match' : 'fb-entry fb-other');
+            return `
+                <div class="${cls}" data-path="${escapeHtml(e.path)}"
+                     data-is-dir="${e.is_dir}" data-is-match="${e.is_match}">
+                    <span class="fb-icon">${icon}</span>
+                    <span class="fb-name">${escapeHtml(e.name)}</span>
+                    <span class="fb-size">
+                        ${e.is_dir ? '' : formatBytes(e.size)}
+                    </span>
+                </div>
+            `;
+        }).join('');
+
+        const upEntry = data.parent
+            ? `<div class="fb-entry fb-dir" data-path="${escapeHtml(data.parent)}"
+                    data-is-dir="true" data-is-match="false">
+                 <span class="fb-icon">📁</span>
+                 <span class="fb-name">..</span>
+                 <span class="fb-size"></span>
+               </div>`
+            : '';
+
+        modal.innerHTML = `
+            <div class="modal-header">
+                <h2>Browse files</h2>
+                <button class="modal-close">✕</button>
+            </div>
+            <div class="fb-cwd">${escapeHtml(data.cwd)}</div>
+            <div class="fb-list">
+                ${upEntry}
+                ${items || '<p class="hint" style="padding: 1rem;">empty</p>'}
+            </div>
+        `;
+
+        modal.querySelector('.modal-close').onclick = close;
+
+        modal.querySelectorAll('.fb-entry').forEach(el => {
+            el.onclick = () => {
+                const isDir = el.dataset.isDir === 'true';
+                const isMatch = el.dataset.isMatch === 'true';
+                if (isDir) {
+                    loadDir(el.dataset.path);
+                } else if (isMatch) {
+                    onSelect(el.dataset.path);
+                    close();
+                }
+                // Non-matching files: clicks are no-ops (dim styling
+                // signals this; we don't need a popup explaining it).
+            };
+        });
+    }
+
+    loadDir(null);
+}
+
+// ---------- step: welcome ----------
+
+async function renderWelcome() {
     const rootWarning = (window.__nomad_health && !window.__nomad_health.is_root)
         ? `<div class="alert warn">
               <strong>Not running as root.</strong>
@@ -85,268 +177,195 @@ function renderWelcome() {
         ${rootWarning}
         <div class="card">
             <h2>Welcome</h2>
-            <p>This tool will write a Project Nomad ISO to a USB drive
-               and pre-populate it with everything Nomad needs to run
-               offline. The target USB will be <strong>completely
-               wiped</strong>.</p>
-            <p>You'll need: an ISO file, a USB drive, and a working
-               internet connection (for the docker pull) — unless you
-               have a pre-built image archive.</p>
+            <p>This tool writes a Project Nomad ISO to a USB drive
+               and pre-populates it with everything Nomad needs to
+               run offline. The target USB will be
+               <strong>completely wiped</strong>.</p>
+            <p>By default, the latest release is downloaded automatically
+               from GitHub. You'll need internet for that download.</p>
+
+            <details class="advanced" id="advanced-toggle">
+                <summary>Advanced options</summary>
+                <div class="advanced-body" id="advanced-body">Loading…</div>
+            </details>
+
             <div class="actions">
                 <span></span>
                 <button class="primary" id="next">Get started</button>
             </div>
         </div>
     `;
-    document.getElementById('next').onclick = () => go('select-iso');
+
+    document.getElementById('next').onclick = () => go('device');
+
+    const adv = document.getElementById('advanced-toggle');
+    let hydrated = false;
+    adv.addEventListener('toggle', async () => {
+        if (adv.open && !hydrated) {
+            hydrated = true;
+            await renderAdvanced();
+        }
+    });
 }
 
-async function renderSelectIso() {
-    // Probe the backend for zenity support — we only show "Browse…"
-    // if there's actually a native dialog available.
-    let zenityOk = false;
-    try {
-        const res = await api('/picker/zenity-available');
-        zenityOk = !!res.available;
-    } catch (e) {
-        // Quietly fall back to the in-app browser if the probe fails.
-    }
+async function renderAdvanced() {
+    const body = document.getElementById('advanced-body');
 
-    // Build the split-button HTML. If zenity isn't available, the
-    // primary action just falls back to the in-app browser, and we
-    // skip the dropdown entirely (nothing to switch between).
-    //
-    // Note: menu visibility is controlled by the .open class on the
-    // wrapper, NOT the [hidden] attribute — the CSS .split-btn-menu
-    // rule sets display:flex which would override [hidden] anyway.
-    const browseButton = zenityOk
-        ? `
-            <div class="split-btn" id="browse-split">
-                <button id="browse-primary" class="split-btn-main">Browse…</button>
-                <button id="browse-toggle" class="split-btn-arrow"
-                        aria-label="Other options">▾</button>
-                <div class="split-btn-menu" id="browse-menu">
-                    <button id="browse-app-menu">Browse files (in-app)…</button>
-                </div>
-            </div>
-        `
-        : `<button id="browse-primary">Browse files…</button>`;
+    const [relsRes, cacheRes] = await Promise.allSettled([
+        api('/releases'),
+        api('/cache'),
+    ]);
 
-    root.innerHTML = `
-        ${header()}
-        <div class="card">
-            <h2>Select ISO</h2>
-            <p>Path to the Nomad live ISO file you built or downloaded.</p>
-            <label for="iso">ISO path</label>
-            <div style="display:flex; gap:0.5rem;">
-                <input type="text" id="iso" placeholder="/path/to/live-image-amd64.hybrid.iso"
-                       value="${state.iso || ''}" style="flex:1;">
-                ${browseButton}
+    const releases = relsRes.status === 'fulfilled' ? relsRes.value : { releases: [], error: relsRes.reason?.message };
+    const cache = cacheRes.status === 'fulfilled' ? cacheRes.value : { versions: [], total_bytes: 0 };
+
+    const releaseOptions = ['<option value="">latest (recommended)</option>']
+        .concat(releases.releases.map(r =>
+            `<option value="${escapeHtml(r.tag)}"
+                     ${state.version === r.tag ? 'selected' : ''}>
+                 ${escapeHtml(r.tag)}
+             </option>`
+        )).join('');
+
+    const releaseError = releases.error
+        ? `<div class="hint" style="color: var(--warn);">
+               (couldn't fetch releases: ${escapeHtml(releases.error)})
+           </div>`
+        : '';
+
+    const cacheRows = cache.versions.length
+        ? cache.versions.map(v => `
+            <div class="cache-row">
+                <span class="cache-tag">${escapeHtml(v.tag)}</span>
+                <span class="cache-size">${formatBytes(v.bytes)}</span>
+                <button class="clear-cache-btn" data-tag="${escapeHtml(v.tag)}">
+                    Clear
+                </button>
             </div>
-            <div class="actions">
-                <button id="back">Back</button>
-                <button class="primary" id="next" disabled>Next</button>
+        `).join('')
+        : `<div class="hint">cache is empty</div>`;
+
+    const cacheTotal = cache.total_bytes
+        ? `<div class="hint" style="margin-top:0.5rem;">
+               Total: ${formatBytes(cache.total_bytes)}
+           </div>`
+        : '';
+
+    body.innerHTML = `
+        <div class="adv-section">
+            <label for="adv-version">Release version</label>
+            <select id="adv-version">${releaseOptions}</select>
+            ${releaseError}
+            <div class="hint">
+                Pick a specific release if you need to reproduce an exact
+                build. Latest is right for almost everyone.
             </div>
+        </div>
+
+        <div class="adv-section">
+            <label for="adv-iso">Local ISO override</label>
+            <div class="input-with-button">
+                <input type="text" id="adv-iso"
+                       placeholder="(empty = download from release)"
+                       value="${escapeHtml(state.isoPathOverride)}">
+                <button id="adv-iso-browse">Browse…</button>
+            </div>
+            <div class="hint">
+                Path to a local ISO file. When set, skips downloading.
+            </div>
+        </div>
+
+        <div class="adv-section">
+            <label for="adv-docker">Local docker tarball override</label>
+            <div class="input-with-button">
+                <input type="text" id="adv-docker"
+                       placeholder="(empty = download from release)"
+                       value="${escapeHtml(state.dockerTarOverride)}">
+                <button id="adv-docker-browse">Browse…</button>
+            </div>
+            <div class="hint">
+                Path to a local <code>.tar.xz</code> or <code>.tar.gz</code>
+                of <code>docker/</code>. Only used in Full mode.
+            </div>
+        </div>
+
+        <div class="adv-section">
+            <label>Download cache</label>
+            <div class="cache-list">${cacheRows}</div>
+            ${cacheTotal}
+            <button id="clear-all-cache" style="margin-top:0.5rem;"
+                    ${cache.versions.length === 0 ? 'disabled' : ''}>
+                Clear all cached downloads
+            </button>
         </div>
     `;
 
-    const input = document.getElementById('iso');
-    const next = document.getElementById('next');
-    const refresh = () => { next.disabled = !input.value.trim(); };
-    input.oninput = refresh;
-    refresh();
+    const verSel = document.getElementById('adv-version');
+    verSel.onchange = () => { state.version = verSel.value || null; };
 
-    document.getElementById('back').onclick = () => go('welcome');
-    next.onclick = () => {
-        state.iso = input.value.trim();
-        go('select-device');
-    };
+    const isoIn = document.getElementById('adv-iso');
+    isoIn.oninput = () => { state.isoPathOverride = isoIn.value.trim(); };
 
-    // Helper: take a path (string or null), set the input field if non-null.
-    const acceptPath = (p) => {
-        if (p) {
-            input.value = p;
-            refresh();
-        }
-    };
-
-    // Native (zenity) picker.
-    const useNative = async () => {
-        try {
-            const res = await fetch('/api/picker/zenity', { method: 'POST' });
-            const data = await res.json();
-            acceptPath(data.path);
-        } catch (e) {
-            console.error('zenity pick failed', e);
-        }
-    };
-
-    // In-app browser.
-    const useInApp = () => openInAppBrowser(acceptPath);
-
-    if (zenityOk) {
-        // Primary button uses zenity, dropdown opens in-app browser.
-        document.getElementById('browse-primary').onclick = useNative;
-
-        const split = document.getElementById('browse-split');
-        const toggle = document.getElementById('browse-toggle');
-
-        toggle.onclick = (e) => {
-            e.stopPropagation();
-            split.classList.toggle('open');
-        };
-
-        document.getElementById('browse-app-menu').onclick = (e) => {
-            e.stopPropagation();
-            split.classList.remove('open');
-            useInApp();
-        };
-
-        // Click anywhere else closes the menu. Persistent listener
-        // (not once:true) so it works after multiple open/close cycles.
-        // We just check whether the click was inside our split-btn.
-        document.addEventListener('click', (e) => {
-            if (!split.contains(e.target)) {
-                split.classList.remove('open');
-            }
+    document.getElementById('adv-iso-browse').onclick = () => {
+        openFileBrowser({
+            allowedExts: ['.iso'],
+            onSelect: (path) => {
+                isoIn.value = path;
+                state.isoPathOverride = path;
+            },
         });
-    } else {
-        // Single button — straight to in-app browser.
-        document.getElementById('browse-primary').onclick = useInApp;
-    }
-}
+    };
 
+    const dockerIn = document.getElementById('adv-docker');
+    dockerIn.oninput = () => { state.dockerTarOverride = dockerIn.value.trim(); };
 
-// In-app file browser. Mounts an overlay over the wizard, lets the
-// user navigate the filesystem to find an ISO, returns the path via
-// callback.
-function openInAppBrowser(onSelect) {
-    const overlay = document.createElement('div');
-    overlay.style.cssText = `
-        position: fixed; inset: 0; z-index: 100;
-        background: rgba(0,0,0,0.7);
-        display: flex; align-items: center; justify-content: center;
-    `;
+    document.getElementById('adv-docker-browse').onclick = () => {
+        openFileBrowser({
+            // We accept either compressed format. The backend sniffs
+            // magic bytes anyway, so the extension is just a hint to
+            // make selection feel right.
+            allowedExts: ['.xz', '.gz', '.tar.xz', '.tar.gz'],
+            onSelect: (path) => {
+                dockerIn.value = path;
+                state.dockerTarOverride = path;
+            },
+        });
+    };
 
-    const modal = document.createElement('div');
-    modal.style.cssText = `
-        background: var(--bg-card); border: 1px solid var(--border);
-        border-radius: var(--radius); padding: 1.5rem;
-        width: min(640px, 95vw); max-height: 85vh;
-        display: flex; flex-direction: column; gap: 0.75rem;
-    `;
-    overlay.appendChild(modal);
-    document.body.appendChild(overlay);
-
-    const close = () => overlay.remove();
-
-    // Click outside the modal closes it.
-    overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) close();
+    body.querySelectorAll('.clear-cache-btn').forEach(btn => {
+        btn.onclick = async () => {
+            const tag = btn.dataset.tag;
+            btn.disabled = true;
+            btn.textContent = 'Clearing…';
+            try {
+                await fetch(`/api/cache?version=${encodeURIComponent(tag)}`,
+                    { method: 'DELETE' });
+                await renderAdvanced();
+            } catch (e) {
+                btn.textContent = 'Failed';
+            }
+        };
     });
 
-    async function loadDir(path) {
-        try {
-            const qs = path ? `?path=${encodeURIComponent(path)}` : '';
-            const data = await api(`/picker/browse${qs}`);
-            render(data);
-        } catch (e) {
-            modal.innerHTML = `<p style="color: var(--danger);">
-                Browse failed: ${escapeHtml(e.message)}
-            </p>
-            <div style="text-align:right;"><button id="bf-close">Close</button></div>`;
-            document.getElementById('bf-close').onclick = close;
+    const clearAll = document.getElementById('clear-all-cache');
+    clearAll.onclick = async () => {
+        if (!confirm('Delete all cached downloads? They will be re-downloaded on the next flash.')) {
+            return;
         }
-    }
-
-    function render(data) {
-        const headerHtml = `
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h2 style="margin:0; font-size:1.05rem;">Browse files</h2>
-                <button id="bf-close" style="padding:0.3rem 0.75rem;">✕</button>
-            </div>
-            <div style="font-family:ui-monospace,monospace; font-size:0.85rem;
-                        color:var(--text-dim); word-break:break-all;">
-                ${escapeHtml(data.cwd)}
-            </div>
-        `;
-
-        const items = data.entries.map(e => {
-            // Style by what they are. Directories: navigable. ISOs: selectable.
-            // Other files: shown in dim color, non-clickable.
-            const icon = e.is_dir ? '📁' : (e.is_iso ? '💿' : '📄');
-            const dim = (!e.is_dir && !e.is_iso) ? 'opacity:0.4;' : '';
-            const cursor = (e.is_dir || e.is_iso) ? 'cursor:pointer;' : '';
-            return `
-                <div class="bf-entry" data-path="${escapeHtml(e.path)}"
-                     data-is-dir="${e.is_dir}" data-is-iso="${e.is_iso}"
-                     style="display:flex; gap:0.5rem; padding:0.4rem 0.5rem;
-                            border-radius:4px; ${dim} ${cursor}">
-                    <span>${icon}</span>
-                    <span style="flex:1;">${escapeHtml(e.name)}</span>
-                    <span style="color:var(--text-dim); font-size:0.8rem;">
-                        ${e.is_dir ? '' : formatSize(e.size)}
-                    </span>
-                </div>
-            `;
-        }).join('');
-
-        const upEntry = data.parent
-            ? `<div class="bf-entry" data-path="${escapeHtml(data.parent)}"
-                    data-is-dir="true" data-is-iso="false"
-                    style="display:flex; gap:0.5rem; padding:0.4rem 0.5rem;
-                           border-radius:4px; cursor:pointer;">
-                <span>📁</span><span>..</span></div>`
-            : '';
-
-        modal.innerHTML = `
-            ${headerHtml}
-            <div style="overflow-y:auto; flex:1; min-height:0;
-                        background:var(--bg); border-radius:6px;
-                        padding:0.5rem;">
-                ${upEntry}
-                ${items || '<p style="color:var(--text-dim);">empty</p>'}
-            </div>
-        `;
-
-        document.getElementById('bf-close').onclick = close;
-
-        modal.querySelectorAll('.bf-entry').forEach(el => {
-            el.addEventListener('mouseenter', () => {
-                el.style.background = 'var(--bg-elev)';
-            });
-            el.addEventListener('mouseleave', () => {
-                el.style.background = '';
-            });
-            el.onclick = () => {
-                const isDir = el.dataset.isDir === 'true';
-                const isIso = el.dataset.isIso === 'true';
-                if (isDir) {
-                    loadDir(el.dataset.path);
-                } else if (isIso) {
-                    onSelect(el.dataset.path);
-                    close();
-                }
-            };
-        });
-    }
-
-    loadDir(null);  // start at default (~/Downloads)
+        clearAll.disabled = true;
+        clearAll.textContent = 'Clearing…';
+        try {
+            await fetch('/api/cache', { method: 'DELETE' });
+            await renderAdvanced();
+        } catch (e) {
+            clearAll.textContent = 'Failed';
+        }
+    };
 }
 
-function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g,
-        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+// ---------- step: device ----------
 
-function formatSize(bytes) {
-    if (bytes < 1024) return bytes + 'B';
-    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + 'K';
-    if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + 'M';
-    return (bytes/1024/1024/1024).toFixed(2) + 'G';
-}
-
-async function renderSelectDevice() {
+async function renderDevice() {
     root.innerHTML = `
         ${header()}
         <div class="card">
@@ -362,8 +381,9 @@ async function renderSelectDevice() {
             </div>
         </div>
     `;
-    document.getElementById('back').onclick = () => go('select-iso');
-    document.getElementById('refresh').onclick = () => renderSelectDevice();
+
+    document.getElementById('back').onclick = () => go('welcome');
+    document.getElementById('refresh').onclick = () => renderDevice();
 
     let data;
     try {
@@ -398,135 +418,93 @@ async function renderSelectDevice() {
         };
     });
 
-    document.getElementById('next').onclick = () => go('select-apps');
+    if (state.device) {
+        const prev = list.querySelector(`.device[data-name="${state.device.name}"]`);
+        if (prev) {
+            prev.classList.add('selected');
+            document.getElementById('next').disabled = false;
+        }
+    }
+
+    document.getElementById('next').onclick = () => go('mode');
 }
 
-async function renderSelectApps() {
+// ---------- step: mode ----------
+
+function renderMode() {
     root.innerHTML = `
         ${header()}
         <div class="card">
-            <h2>Optional apps</h2>
-            <p>Bundle additional Nomad app images so they're ready to
-               install offline from the Command Center. The base stack
-               (admin, mysql, redis, dozzle) is always included.</p>
-            <div id="apps-toolbar" class="apps-toolbar"></div>
-            <div id="apps-list">Loading…</div>
+            <h2>Choose a mode</h2>
+            <p>Both modes give you the same Nomad. They differ only
+               in when the container images are downloaded.</p>
+
+            <div class="mode-grid">
+                <div class="mode-card ${state.flashMode === 'full' ? 'selected' : ''}"
+                     data-mode="full">
+                    <div class="mode-card-title">Full</div>
+                    <div class="mode-card-tag">recommended</div>
+                    <div class="mode-card-desc">
+                        Downloads everything now (~4.4 GB). The USB will
+                        boot and Nomad will be ready in a few minutes.
+                        <strong>Works fully offline</strong> after flashing.
+                    </div>
+                </div>
+
+                <div class="mode-card ${state.flashMode === 'base' ? 'selected' : ''}"
+                     data-mode="base">
+                    <div class="mode-card-title">Base only</div>
+                    <div class="mode-card-tag">smaller download</div>
+                    <div class="mode-card-desc">
+                        Downloads just the ISO (~1 GB). Container images
+                        will be pulled on first boot, so the laptop you
+                        boot the USB on <strong>needs internet</strong>
+                        the first time.
+                    </div>
+                </div>
+            </div>
+
             <div class="actions">
                 <button id="back">Back</button>
-                <span style="display:flex; align-items:center; gap:1rem;">
-                    <span id="size-hint" style="color:var(--text-dim); font-size:0.85rem;"></span>
-                    <button class="primary" id="next">Next</button>
-                </span>
+                <button class="primary" id="next">Next</button>
             </div>
         </div>
     `;
-    document.getElementById('back').onclick = () => go('select-device');
+
+    document.getElementById('back').onclick = () => go('device');
     document.getElementById('next').onclick = () => go('confirm');
 
-    let data;
-    try {
-        data = await api('/apps');
-        // Cache the catalog globally so the confirm screen can show
-        // friendly names instead of bare keys (the user's selections
-        // are stored as keys in state.apps).
-        window.__nomad_apps = data.apps;
-    } catch (e) {
-        document.getElementById('apps-list').textContent = `Error: ${e.message}`;
-        return;
-    }
-
-    const list = document.getElementById('apps-list');
-    const sizeHint = document.getElementById('size-hint');
-
-    list.innerHTML = data.apps.map(a => {
-        // Each app is a row with a checkbox, name (bold), small "powered by"
-        // sized hint, and the description below. Clicking anywhere on the
-        // row toggles the checkbox — easier target than the box itself.
-        const checked = state.apps.has(a.key) ? 'checked' : '';
-        const sizeStr = a.approx_mb >= 1000
-            ? `${(a.approx_mb / 1000).toFixed(1)} GB`
-            : `${a.approx_mb} MB`;
-        return `
-            <label class="app-row" data-key="${a.key}">
-                <input type="checkbox" data-key="${a.key}" ${checked}>
-                <div class="app-meta">
-                    <div class="app-name">${escapeHtml(a.name)}
-                        <span class="app-size">~${sizeStr}</span>
-                    </div>
-                    <div class="app-desc">${escapeHtml(a.description)}</div>
-                </div>
-            </label>
-        `;
-    }).join('');
-
-    // Render the toolbar above the apps list. Two pill buttons that
-    // toggle the whole list. They're separate buttons (rather than one
-    // toggle that flips between states) because most users want a
-    // direct action — "select all now" — and a single toggle button
-    // means scanning the label to know what it'll do.
-    const toolbar = document.getElementById('apps-toolbar');
-    toolbar.innerHTML = `
-        <button class="link-btn" id="select-all">Select all</button>
-        <span class="toolbar-sep">·</span>
-        <button class="link-btn" id="select-none">Clear</button>
-    `;
-
-    // Update the running size estimate whenever a checkbox changes,
-    // and keep the state.apps Set in sync.
-    const updateSize = () => {
-        let totalMB = 0;
-        for (const a of data.apps) {
-            if (state.apps.has(a.key)) totalMB += a.approx_mb;
-        }
-        if (totalMB === 0) {
-            sizeHint.textContent = 'base stack only';
-        } else {
-            const sz = totalMB >= 1000 ? `${(totalMB/1000).toFixed(1)} GB` : `${totalMB} MB`;
-            sizeHint.textContent = `+${sz} of optional apps`;
-        }
-    };
-
-    // Bulk toggle helper used by both buttons. Avoids triggering the
-    // per-checkbox 'change' handler N times — we update state.apps and
-    // call updateSize() once at the end.
-    const setAll = (checked) => {
-        list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-            cb.checked = checked;
-            const key = cb.dataset.key;
-            if (checked) state.apps.add(key);
-            else state.apps.delete(key);
-        });
-        updateSize();
-    };
-
-    document.getElementById('select-all').onclick = () => setAll(true);
-    document.getElementById('select-none').onclick = () => setAll(false);
-
-    list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-        cb.addEventListener('change', () => {
-            const key = cb.dataset.key;
-            if (cb.checked) state.apps.add(key);
-            else state.apps.delete(key);
-            updateSize();
-        });
+    root.querySelectorAll('.mode-card').forEach(el => {
+        el.onclick = () => {
+            root.querySelectorAll('.mode-card').forEach(e => e.classList.remove('selected'));
+            el.classList.add('selected');
+            state.flashMode = el.dataset.mode;
+        };
     });
-    updateSize();
 }
+
+// ---------- step: confirm ----------
 
 function renderConfirm() {
     const dev = state.device;
+    const versionLabel = state.version || 'latest';
+    const sourceLabel = state.flashMode === 'full'
+        ? 'ISO + prebuilt docker tree'
+        : 'ISO only (containers pull on first boot)';
 
-    // Convert the user's selected app keys into friendly display
-    // names using the catalog we cached during the apps step.
-    const catalog = window.__nomad_apps || [];
-    const selectedNames = [...state.apps]
-        .map(key => {
-            const a = catalog.find(c => c.key === key);
-            return a ? a.name : key;
-        });
-    const appsLine = selectedNames.length
-        ? selectedNames.join(', ')
-        : '(none — base stack only)';
+    const overrides = [];
+    if (state.isoPathOverride) {
+        overrides.push(`<li>Using local ISO: <code>${escapeHtml(state.isoPathOverride)}</code></li>`);
+    }
+    if (state.dockerTarOverride && state.flashMode === 'full') {
+        overrides.push(`<li>Using local docker tarball: <code>${escapeHtml(state.dockerTarOverride)}</code></li>`);
+    }
+    const overrideHtml = overrides.length
+        ? `<div class="hint" style="margin-top:0.75rem;">
+               <strong>Overrides:</strong>
+               <ul style="margin:0.25rem 0 0 1rem; padding:0;">${overrides.join('')}</ul>
+           </div>`
+        : '';
 
     root.innerHTML = `
         ${header()}
@@ -536,27 +514,54 @@ function renderConfirm() {
                 <strong>This will erase /dev/${dev?.name || '?'} completely.</strong>
                 All existing data on the drive will be lost.
             </div>
-            <p><strong>ISO:</strong> ${state.iso}</p>
             <p><strong>Device:</strong> /dev/${dev?.name || '?'}
                (${dev?.size || '?'} ${dev?.model || ''})</p>
-            <p><strong>Optional apps:</strong> ${escapeHtml(appsLine)}</p>
+            <p><strong>Mode:</strong> ${state.flashMode}
+               <span style="color:var(--text-dim);">— ${sourceLabel}</span></p>
+            <p><strong>Release:</strong> ${escapeHtml(versionLabel)}</p>
+            ${overrideHtml}
             <div class="actions">
                 <button id="back">Back</button>
                 <button class="danger" id="flash">Wipe and flash</button>
             </div>
         </div>
     `;
-    document.getElementById('back').onclick = () => go('select-apps');
+    document.getElementById('back').onclick = () => go('mode');
     document.getElementById('flash').onclick = () => go('progress');
 }
+
+// ---------- step: progress ----------
+//
+// New design (v0.6.1):
+//   - Big visual progress bar at the top showing overall completion
+//   - Step name + step counter shown alongside
+//   - Logs collapsed by default in <details>, auto-expands on error
+//   - Log buffer capped to LOG_BUFFER_LINES so we can't blow out
+//     browser memory if a step gets chatty (this is what fixed the
+//     v0.6.0 25GB-RAM bug)
+
+const LOG_BUFFER_LINES = 500;   // keep last N lines only
 
 function renderProgress() {
     root.innerHTML = `
         ${header()}
         <div class="card">
-            <h2 id="step-title">Flashing…</h2>
+            <h2 id="step-title">Starting…</h2>
             <p>Don't unplug the drive or close this window.</p>
-            <div class="log" id="log"></div>
+
+            <div class="overall-progress">
+                <div class="overall-progress-bar">
+                    <div class="overall-progress-fill" id="overall-fill"
+                         style="width: 0%;"></div>
+                </div>
+                <div class="overall-progress-text" id="overall-text">0%</div>
+            </div>
+
+            <details id="log-details">
+                <summary>Show logs</summary>
+                <div class="log" id="log"></div>
+            </details>
+
             <div class="actions" id="actions" style="display:none;">
                 <span></span>
                 <button class="primary" id="continue">Continue</button>
@@ -566,65 +571,141 @@ function renderProgress() {
 
     const logEl = document.getElementById('log');
     const titleEl = document.getElementById('step-title');
+    const fillEl = document.getElementById('overall-fill');
+    const textEl = document.getElementById('overall-text');
+    const detailsEl = document.getElementById('log-details');
     const actionsEl = document.getElementById('actions');
 
+    // Log buffer — array of strings, bounded length. Only the visible
+    // text in the DOM is the joined buffer, so we don't grow textNodes
+    // forever.
+    const buf = [];
     const append = (text) => {
-        logEl.textContent += text + '\n';
+        // Split multi-line text and push each line so the buffer cap
+        // is line-based, not write-based.
+        const lines = String(text).split('\n');
+        for (const line of lines) {
+            buf.push(line);
+        }
+        // Keep only the last N lines. Splice from the front when over.
+        if (buf.length > LOG_BUFFER_LINES) {
+            buf.splice(0, buf.length - LOG_BUFFER_LINES);
+        }
+        // Single textContent assignment is the one expensive op here,
+        // but we only do it once per message, not per line.
+        logEl.textContent = buf.join('\n');
         logEl.scrollTop = logEl.scrollHeight;
     };
 
-    // WebSocket URL: derive from the current page so it works on any host/port.
+    // Track step counters so we can compute overall progress.
+    let totalSteps = 0;
+    let completedSteps = 0;
+    let currentStepFraction = 0;  // 0..1, fraction of current step done
+
+    const updateBar = () => {
+        if (totalSteps === 0) return;
+        // Each step is worth (100/totalSteps) percent of the overall bar.
+        // completedSteps counts steps that have FINISHED (so the next
+        // ::step:: marker increments it). currentStepFraction is the
+        // partial progress within the running step.
+        const overall = ((completedSteps + currentStepFraction) / totalSteps) * 100;
+        const clamped = Math.max(0, Math.min(100, overall));
+        fillEl.style.width = clamped.toFixed(1) + '%';
+        textEl.textContent = clamped.toFixed(0) + '%';
+    };
+
     const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://')
                   + location.host + '/ws/flash';
     const ws = new WebSocket(wsUrl);
-
     let failed = false;
 
     ws.onopen = () => {
-        // Send config as the first message.
         ws.send(JSON.stringify({
-            iso_path: state.iso,
             device: '/dev/' + state.device.name,
-            apps: [...state.apps],
-            archive_path: state.fromArchive,
-            no_cache: false,
+            flash_mode: state.flashMode,
+            version: state.version,
+            iso_path: state.isoPathOverride || null,
+            prebuilt_docker_path: state.dockerTarOverride || null,
         }));
-        append('Connected. Starting…\n');
+        append('Connected. Starting…');
     };
 
     ws.onmessage = (ev) => {
         const line = ev.data;
 
-        // Sentinel lines control UI state; everything else is just logged.
+        // ---- ::step::N/TOTAL::NAME — step boundary marker ----
+        // The first such marker tells us totalSteps. Every subsequent
+        // marker advances the completed counter.
         if (line.startsWith('::step::')) {
-            // Format: ::step::CURRENT/TOTAL::NAME
             const parts = line.split('::').slice(2);
             const [counter, ...nameParts] = parts;
             const name = nameParts.join('::');
-            titleEl.textContent = `${counter}  ${name}`;
+            const m = counter.match(/^(\d+)\/(\d+)$/);
+            if (m) {
+                const stepNum = parseInt(m[1], 10);
+                totalSteps = parseInt(m[2], 10);
+                // The marker says "starting step N", so completed = N-1.
+                // Reset within-step fraction since we're entering a new step.
+                completedSteps = stepNum - 1;
+                currentStepFraction = 0;
+            }
+            titleEl.textContent = `Step ${counter} — ${name}`;
+            updateBar();
             append(`\n--- ${name} ---`);
-        } else if (line === '::done::') {
+            return;
+        }
+
+        // ---- ::progress::N — within-step progress (0-100) ----
+        if (line.startsWith('::progress::')) {
+            const pct = parseInt(line.slice('::progress::'.length), 10);
+            if (!isNaN(pct)) {
+                currentStepFraction = Math.max(0, Math.min(100, pct)) / 100;
+                updateBar();
+            }
+            return;
+        }
+
+        // ---- ::done:: — pipeline finished successfully ----
+        if (line === '::done::') {
             titleEl.textContent = 'Done';
-        } else if (line.startsWith('::error::')) {
+            completedSteps = totalSteps;
+            currentStepFraction = 0;
+            updateBar();
+            return;
+        }
+
+        // ---- ::error::msg — pipeline failed ----
+        if (line.startsWith('::error::')) {
             failed = true;
             append('\n!! ' + line.slice('::error::'.length));
             titleEl.textContent = 'Failed';
-        } else {
-            append(line);
+            // Auto-open the logs panel so the user can see what happened
+            // without having to click into it.
+            detailsEl.open = true;
+            return;
         }
+
+        // ---- regular log line ----
+        append(line);
     };
 
     ws.onclose = () => {
         if (failed) {
             append('\n[connection closed after error]');
-            // Provide a way to restart the wizard
             actionsEl.style.display = 'flex';
             const btn = document.getElementById('continue');
             btn.textContent = 'Start over';
-            btn.onclick = () => go('welcome');
+            btn.onclick = () => {
+                resetState();
+                go('welcome');
+            };
         } else {
             append('\n[done]');
-            // Move to the done screen
+            // Make sure the bar lands at 100% even if the last
+            // ::done:: marker arrived before any progress markers.
+            completedSteps = totalSteps || 1;
+            currentStepFraction = 0;
+            updateBar();
             actionsEl.style.display = 'flex';
             document.getElementById('continue').onclick = () => go('done');
         }
@@ -632,9 +713,13 @@ function renderProgress() {
 
     ws.onerror = (ev) => {
         append('\n!! WebSocket error');
+        // Open logs so the error is visible.
+        detailsEl.open = true;
         console.error('ws error', ev);
     };
 }
+
+// ---------- step: done ----------
 
 function renderDone() {
     root.innerHTML = `
@@ -642,6 +727,11 @@ function renderDone() {
         <div class="card">
             <h2>Done</h2>
             <p>Your Nomad USB is ready. Boot it on the target machine.</p>
+            <p style="color:var(--text-dim); font-size:0.9rem;">
+                On first boot, log in as <code>nomad</code> /
+                <code>nomad</code>. The MOTD shows the URL to access
+                Nomad and how to start a hotspot if needed.
+            </p>
             <div class="actions">
                 <span></span>
                 <button class="primary" id="restart">Flash another</button>
@@ -649,21 +739,25 @@ function renderDone() {
         </div>
     `;
     document.getElementById('restart').onclick = () => {
-        state.iso = null; state.device = null; state.apps.clear();
+        resetState();
         go('welcome');
     };
+}
+
+function resetState() {
+    state.device = null;
+    state.flashMode = 'full';
 }
 
 // ---------- router ----------
 
 const STEP_RENDERERS = {
-    'welcome':       renderWelcome,
-    'select-iso':    renderSelectIso,
-    'select-device': renderSelectDevice,
-    'select-apps':   renderSelectApps,
-    'confirm':       renderConfirm,
-    'progress':      renderProgress,
-    'done':          renderDone,
+    'welcome':  renderWelcome,
+    'device':   renderDevice,
+    'mode':     renderMode,
+    'confirm':  renderConfirm,
+    'progress': renderProgress,
+    'done':     renderDone,
 };
 
 function go(step) {
@@ -676,10 +770,8 @@ function go(step) {
 (async () => {
     try {
         const health = await api('/health');
-        window.__nomad_health = health;  // for screens that want to react
-        // Surface the version into state so header() can render it.
-        // Default fallback to "?" if the backend somehow omits it.
-        state.version = health.version || '?';
+        window.__nomad_health = health;
+        state.version_label = health.version || '?';
         console.log('backend ok', health);
     } catch (e) {
         root.innerHTML = `<div class="alert danger">
